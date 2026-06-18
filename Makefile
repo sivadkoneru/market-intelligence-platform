@@ -10,10 +10,10 @@ test:
 	.venv/bin/python -m pytest -q
 
 lint:
-	@echo "lint: configured in T1"
+	.venv/bin/ruff check .
 
 format:
-	@echo "format: configured in T1"
+	.venv/bin/black . && .venv/bin/ruff check --fix .
 
 up:
 	docker compose up -d

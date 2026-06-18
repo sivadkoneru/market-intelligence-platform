@@ -1,4 +1,5 @@
 """Smoke test: repo structure, README, and tooling exist."""
+
 from pathlib import Path
 
 

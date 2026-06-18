@@ -56,6 +56,18 @@ make clean         # Remove venv and caches
 
 ## Development
 
+### Setup and Build Commands
+
+```bash
+make setup         # Create .venv and install all dev dependencies
+make test          # Run pytest suite (auto-runs setup if needed)
+make lint          # Check code style with ruff
+make format        # Format code with black and ruff
+make clean         # Remove .venv and all cache directories
+```
+
+### Stack
+
 - **Language**: Python 3.12 (local dev with Python 3.11 venv for compatibility)
 - **Async**: asyncio throughout
 - **API**: FastAPI + Uvicorn
@@ -64,3 +76,5 @@ make clean         # Remove venv and caches
 - **Vector search**: Elasticsearch kNN
 - **Databases**: PostgreSQL, Redis
 - **LLM**: Azure OpenAI, Claude, or MOCK_LLM (default)
+- **Linting/Formatting**: ruff, black
+- **Testing**: pytest, pytest-asyncio

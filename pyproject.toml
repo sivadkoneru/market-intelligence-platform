@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-intel-platform"
+version = "0.1.0"
+description = "AI-Powered Market Intelligence Platform: ingests crypto market data and news events, computes technical indicators and RAG-driven insights, and serves them over REST and WebSocket APIs."
+requires-python = ">=3.11"
+authors = [
+    {name = "Siva Koneru", email = "siko056@expert.micro1.ai"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests", "libs", "services"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["libs", "services"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
