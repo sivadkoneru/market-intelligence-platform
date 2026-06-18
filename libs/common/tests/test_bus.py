@@ -6,6 +6,7 @@ from libs.common.bus import (
     InMemoryBus,
     ReceivedMessage,
     ServiceBusBus,
+    _decode_servicebus_body,
     _SBMessageRef,
     get_message_bus,
 )
@@ -204,6 +205,12 @@ class _FakeReceiver:
         self.dead_lettered: list = []
         self.received = received or []
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
     async def complete_message(self, raw_msg) -> None:
         self.completed.append(raw_msg)
 
@@ -213,6 +220,9 @@ class _FakeReceiver:
     async def receive_messages(self, **kwargs):
         return list(self.received)
 
+    async def peek_messages(self, **kwargs):
+        return list(self.received)[: kwargs.get("max_message_count", len(self.received))]
+
 
 class _FakeRawMessage:
     """Minimal stand-in for ServiceBusReceivedMessage."""
@@ -220,7 +230,7 @@ class _FakeRawMessage:
     def __init__(
         self,
         mid: str = "msg-1",
-        body: bytes = b'{"v": 1}',
+        body: object = b'{"v": 1}',
         correlation_id: str | None = "corr-1",
     ) -> None:
         self.message_id = mid
@@ -254,6 +264,12 @@ def _make_servicebus_bus_with_fake_receiver(
     fake_receiver = _FakeReceiver()
     bus._receivers[(topic, subscription, None)] = fake_receiver
     return bus, fake_receiver
+
+
+def test_decode_servicebus_body_accepts_bytes_strings_and_sections():
+    assert _decode_servicebus_body(b'{"v": 1}') == {"v": 1}
+    assert _decode_servicebus_body('{"v": 2}') == {"v": 2}
+    assert _decode_servicebus_body([b'{"v"', memoryview(b": 3}")]) == {"v": 3}
 
 
 @pytest.mark.asyncio
@@ -298,8 +314,45 @@ async def test_servicebus_dead_letter_calls_receiver_dead_letter_message():
 
 
 @pytest.mark.asyncio
+async def test_servicebus_receive_decodes_sectioned_body():
+    raw = _FakeRawMessage("id-sectioned", body=[b'{"v"', b": 1}"])
+    fake_rx = _FakeReceiver(received=[raw])
+    fake_client = _FakeServiceBusClient(fake_rx)
+    bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._client = fake_client
+
+    messages = await bus.receive("topic", "sub")
+
+    assert len(messages) == 1
+    assert messages[0].body == {"v": 1}
+    assert messages[0]._queue_ref.raw is raw
+    assert fake_client.receiver_calls == [
+        {"topic_name": "topic", "subscription_name": "sub"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_servicebus_peek_decodes_sectioned_body():
+    raw = _FakeRawMessage("id-peek", body=[b'{"peek"', b": true}"])
+    fake_rx = _FakeReceiver(received=[raw])
+    fake_client = _FakeServiceBusClient(fake_rx)
+    bus = object.__new__(ServiceBusBus)
+    bus._client = fake_client
+
+    messages = await bus.peek("topic", "sub")
+
+    assert len(messages) == 1
+    assert messages[0].body == {"peek": True}
+    assert fake_client.receiver_calls == [
+        {"topic_name": "topic", "subscription_name": "sub"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_servicebus_receive_dead_letter_keeps_receiver_for_settlement():
-    raw = _FakeRawMessage("id-dlq", body=b'{"bad": true}')
+    raw = _FakeRawMessage("id-dlq", body=[b'{"bad"', b": true}"])
     fake_rx = _FakeReceiver(received=[raw])
     fake_client = _FakeServiceBusClient(fake_rx)
     bus = object.__new__(ServiceBusBus)

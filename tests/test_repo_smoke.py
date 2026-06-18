@@ -37,7 +37,7 @@ def test_readme_has_disclaimer():
 
 
 def test_taskfile_exists():
-    """Assert Taskfile.yml exists (migrated from Makefile)."""
+    """Assert Taskfile.yml."""
     repo_root = Path(__file__).parent.parent
     taskfile_path = repo_root / "Taskfile.yml"
     assert taskfile_path.exists(), "Taskfile.yml does not exist"

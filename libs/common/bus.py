@@ -18,6 +18,7 @@ ReceivedMessage     — Simple dataclass representing a received message.
 from __future__ import annotations
 
 import dataclasses
+import json
 import uuid
 from collections import defaultdict, deque
 from typing import Any, Protocol, runtime_checkable
@@ -228,6 +229,35 @@ class _SBMessageRef:
     receiver: Any
 
 
+def _decode_servicebus_body(raw_body: Any) -> dict[str, Any]:
+    """
+    Decode Azure Service Bus message bodies into JSON payloads.
+
+    Azure SDK received bodies can be raw bytes or an iterable of AMQP body
+    sections. Joining explicit sections avoids ``bytes(raw.body)`` treating
+    those chunks as integer iterables.
+    """
+    if isinstance(raw_body, str):
+        data = raw_body.encode("utf-8")
+    elif isinstance(raw_body, (bytes, bytearray, memoryview)):
+        data = bytes(raw_body)
+    else:
+        chunks: list[bytes] = []
+        for section in raw_body:
+            if isinstance(section, str):
+                chunks.append(section.encode("utf-8"))
+            elif isinstance(section, (bytes, bytearray, memoryview)):
+                chunks.append(bytes(section))
+            else:
+                chunks.append(bytes(section))
+        data = b"".join(chunks)
+
+    parsed = json.loads(data)
+    if not isinstance(parsed, dict):
+        raise TypeError("Service Bus message body must decode to a JSON object")
+    return parsed
+
+
 class ServiceBusBus:
     """
     Thin async wrapper over ``azure.servicebus`` topics + subscriptions.
@@ -288,8 +318,6 @@ class ServiceBusBus:
         message_id: str | None = None,
         correlation_id: str | None = None,
     ) -> None:
-        import json
-
         from azure.servicebus import ServiceBusMessage
 
         sender = self._client.get_topic_sender(topic_name=topic)
@@ -311,15 +339,13 @@ class ServiceBusBus:
         subscription: str,
         max_messages: int = 10,
     ) -> list[ReceivedMessage]:
-        import json
-
         receiver = self._get_receiver(topic, subscription)
         received = await receiver.receive_messages(
             max_message_count=max_messages, max_wait_time=5
         )
         msgs: list[ReceivedMessage] = []
         for raw in received:
-            body = json.loads(bytes(raw.body))
+            body = _decode_servicebus_body(raw.body)
             msgs.append(
                 ReceivedMessage(
                     topic=topic,
@@ -349,8 +375,6 @@ class ServiceBusBus:
         subscription: str,
         n: int = 10,
     ) -> list[ReceivedMessage]:
-        import json
-
         receiver = self._client.get_subscription_receiver(
             topic_name=topic,
             subscription_name=subscription,
@@ -359,7 +383,7 @@ class ServiceBusBus:
         async with receiver:
             peeked = await receiver.peek_messages(max_message_count=n)
             for raw in peeked:
-                body = json.loads(bytes(raw.body))
+                body = _decode_servicebus_body(raw.body)
                 msgs.append(
                     ReceivedMessage(
                         topic=topic,
@@ -376,13 +400,11 @@ class ServiceBusBus:
         topic: str,
         subscription: str,
     ) -> list[ReceivedMessage]:
-        import json
-
         receiver = self._get_receiver(topic, subscription, sub_queue="deadletter")
         msgs: list[ReceivedMessage] = []
         received = await receiver.receive_messages(max_message_count=100, max_wait_time=5)
         for raw in received:
-            body = json.loads(bytes(raw.body))
+            body = _decode_servicebus_body(raw.body)
             msgs.append(
                 ReceivedMessage(
                     topic=topic,

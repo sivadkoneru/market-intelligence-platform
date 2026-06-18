@@ -22,6 +22,7 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 SB_CONFIG_FILE = REPO_ROOT / "infra" / "servicebus-config.json"
+DRUID_ENV_FILE = REPO_ROOT / "infra" / "druid" / "environment"
 GRAFANA_ROOT = REPO_ROOT / "infra" / "grafana"
 GRAFANA_PROVISIONING_DIR = GRAFANA_ROOT / "provisioning"
 GRAFANA_DATASOURCES_FILE = GRAFANA_PROVISIONING_DIR / "datasources" / "datasources.yaml"
@@ -290,6 +291,15 @@ class TestComposeServices:
         assert env["druid_metadata_storage_connector_password"] == (
             "${DRUID_POSTGRES_PASSWORD:-mip_local}"
         )
+
+    def test_druid_extension_config_is_kafka_free(self, services: dict) -> None:
+        env = services["druid"].get("environment", {})
+        compose_extensions = env["druid_extensions_loadList"]
+        file_extensions = DRUID_ENV_FILE.read_text(encoding="utf-8")
+
+        assert "druid-kafka-indexing-service" not in compose_extensions
+        assert "druid-kafka-indexing-service" not in file_extensions
+        assert "postgresql-metadata-storage" in file_extensions
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ def test_api_requirements_are_pinned() -> None:
     assert lines
     assert all("==" in line for line in lines)
     assert "fastapi==0.115.6" in lines
+    assert "newrelic==13.1.1" in lines
     assert "azure-servicebus==7.12.3" in lines
     assert "redis==5.2.1" in lines
     assert "elasticsearch==8.17.0" in lines

@@ -33,7 +33,7 @@ druid_server_http_numThreads=10
 druid_startup_logging_logProperties=true
 
 # --- Extension loading ---
-druid_extensions_loadList=["druid-histogram","druid-datasketches","postgresql-metadata-storage","druid-kafka-indexing-service"]
+druid_extensions_loadList=["druid-histogram","druid-datasketches","postgresql-metadata-storage"]
 
 # --- Java memory (reduced for single-node local profile) ---
 DRUID_XMX=512m
