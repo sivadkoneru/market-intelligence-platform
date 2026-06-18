@@ -9,8 +9,13 @@ A multi-service Python platform that ingests live crypto market data and news/so
 task setup
 task test
 
-# Start the entire platform (when compose file is ready)
-docker compose up -d
+# Start the entire platform
+cp .env.example .env
+task up
+
+# Smoke helpers
+task smoke:sb
+task smoke:ws
 ```
 
 See `CLAUDE.md` for the full codebase guide, architecture conventions, and commit rules.
@@ -54,6 +59,7 @@ See `docs/ARCHITECTURE.md` for system design, data flow diagrams, and component 
 ```bash
 task test          # Run pytest suite
 task clean         # Remove venv and caches
+make test          # Thin wrapper around task test
 ```
 
 ## Development
@@ -65,8 +71,16 @@ task setup         # Create .venv and install all dev dependencies
 task test          # Run pytest suite (auto-runs setup if needed)
 task lint          # Check code style with ruff
 task format        # Format code with black and ruff
+task up            # Build and start infra + all five app services
+task down          # Stop containers and remove volumes
+task ps            # Show compose status
+task smoke:sb      # Peek Service Bus topic messages
+task smoke:ws      # Subscribe to the API websocket smoke stream
 task clean         # Remove .venv and all cache directories
 ```
+
+`make setup`, `make test`, and the other top-level targets are thin wrappers around the
+same `task` commands for environments that expect `make`.
 
 ### Stack
 

@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--url",
-        default="ws://127.0.0.1:8005/ws/stream",
+        default="ws://127.0.0.1:8000/ws/stream",
         help="WebSocket URL for the API stream endpoint.",
     )
     parser.add_argument(

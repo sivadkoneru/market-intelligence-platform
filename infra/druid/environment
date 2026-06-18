@@ -4,9 +4,9 @@
 
 # --- Metadata storage (PostgreSQL) ---
 druid_metadata_storage_type=postgresql
-druid_metadata_storage_connector_connectURI=jdbc:postgresql://postgres:5432/druid
-druid_metadata_storage_connector_user=${POSTGRES_USER:-druid}
-druid_metadata_storage_connector_password=${POSTGRES_PASSWORD:-druid}
+druid_metadata_storage_connector_connectURI=jdbc:postgresql://postgres:5432/${DRUID_POSTGRES_DB:-mip}
+druid_metadata_storage_connector_user=${DRUID_POSTGRES_USER:-mip}
+druid_metadata_storage_connector_password=${DRUID_POSTGRES_PASSWORD:-mip_local}
 
 # --- ZooKeeper ---
 druid_zk_service_host=zookeeper

@@ -67,6 +67,7 @@ def test_parser_only_uses_default_symbol_when_omitted() -> None:
     )
 
     assert default_args.symbols is None
+    assert default_args.url == "ws://127.0.0.1:8000/ws/stream"
     assert default_args.messages == 1
     assert default_args.timeout_seconds == 15.0
     assert explicit_args.symbols == ["ETHUSDT"]

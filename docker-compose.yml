@@ -1,7 +1,4 @@
-# docker-compose.yml — Market Intelligence Platform: infrastructure services
-# T4 delivers infra only; Python app services (ingestion, stream, ai-analysis,
-# alerting, api) are added in T18 once their Dockerfiles exist.
-#
+# docker-compose.yml — Market Intelligence Platform: infra + application services
 # Druid profile: micro-quickstart single-node (apache/druid image with
 # DRUID_SINGLE_NODE_CONF=micro-quickstart).  Trade-off: simpler compose and
 # lower RAM (~2 GB vs ~6 GB for a full split topology), at the cost of no
@@ -18,6 +15,11 @@ x-druid-common: &druid-common
       condition: service_healthy
     zookeeper:
       condition: service_healthy
+  networks:
+    - mip-net
+  restart: unless-stopped
+
+x-app-common: &app-common
   networks:
     - mip-net
   restart: unless-stopped
@@ -145,9 +147,9 @@ services:
     environment:
       DRUID_SINGLE_NODE_CONF: micro-quickstart
       druid_metadata_storage_type: postgresql
-      druid_metadata_storage_connector_connectURI: "jdbc:postgresql://postgres:5432/${POSTGRES_DB:-mip}"
-      druid_metadata_storage_connector_user: "${POSTGRES_USER:-mip}"
-      druid_metadata_storage_connector_password: "${POSTGRES_PASSWORD:-mip_local}"
+      druid_metadata_storage_connector_connectURI: "jdbc:postgresql://postgres:5432/${DRUID_POSTGRES_DB:-mip}"
+      druid_metadata_storage_connector_user: "${DRUID_POSTGRES_USER:-mip}"
+      druid_metadata_storage_connector_password: "${DRUID_POSTGRES_PASSWORD:-mip_local}"
       druid_zk_service_host: zookeeper
       druid_storage_type: local
       druid_storage_storageDirectory: /opt/druid/var/druid/segments
@@ -227,7 +229,7 @@ services:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_INSTALL_PLUGINS: "marcusolsson-json-datasource 1.3.24"
+      GF_PLUGINS_PREINSTALL: "marcusolsson-json-datasource@1.3.24"
     volumes:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
@@ -245,4 +247,206 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
+      start_period: 20s
+
+  ingestion:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    container_name: mip-ingestion
+    environment:
+      SERVICE_NAME: ingestion
+      SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+      REDIS_URL: "redis://redis:6379/0"
+      DRUID_URL: "http://druid:8888"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
+      MOCK_LLM: "${MOCK_LLM:-1}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
+      NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
+      NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
+      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      - "8001:8001"
+    depends_on:
+      servicebus-emulator:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  stream:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: services/stream/Dockerfile
+    container_name: mip-stream
+    environment:
+      SERVICE_NAME: stream
+      SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+      REDIS_URL: "redis://redis:6379/0"
+      DRUID_URL: "http://druid:8888"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
+      MOCK_LLM: "${MOCK_LLM:-1}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
+      NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
+      NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
+      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      - "8002:8002"
+    depends_on:
+      servicebus-emulator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      druid:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  ai-analysis:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: services/ai/Dockerfile
+    container_name: mip-ai-analysis
+    environment:
+      SERVICE_NAME: ai-analysis
+      SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+      REDIS_URL: "redis://redis:6379/0"
+      DRUID_URL: "http://druid:8888"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
+      MOCK_LLM: "${MOCK_LLM:-1}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
+      NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
+      NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
+      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      - "8003:8003"
+    depends_on:
+      servicebus-emulator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  alerting:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: services/alerting/Dockerfile
+    container_name: mip-alerting
+    environment:
+      SERVICE_NAME: alerting
+      SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+      REDIS_URL: "redis://redis:6379/0"
+      DRUID_URL: "http://druid:8888"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
+      MOCK_LLM: "${MOCK_LLM:-1}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
+      NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
+      NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
+      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      - "8004:8004"
+    depends_on:
+      servicebus-emulator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  api:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: mip-api
+    environment:
+      SERVICE_NAME: api
+      SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+      REDIS_URL: "redis://redis:6379/0"
+      DRUID_URL: "http://druid:8888"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
+      MOCK_LLM: "${MOCK_LLM:-1}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
+      NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
+      NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
+      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      - "8000:8005"
+    depends_on:
+      servicebus-emulator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      druid:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
       start_period: 20s

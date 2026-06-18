@@ -16,6 +16,8 @@ def test_ingestion_requirements_are_pinned() -> None:
     assert "fastapi==0.115.6" in lines
     assert "azure-servicebus==7.12.3" in lines
     assert "websockets==13.1" in lines
+    assert "tenacity==9.0.0" in lines
+    assert "elasticsearch==8.17.0" in lines
 
 
 def test_ingestion_dockerfile_uses_runtime_pattern() -> None:

@@ -34,9 +34,9 @@ tasks:
       - .venv/bin/ruff check --fix .
 
   up:
-    desc: Start all infrastructure services in the background
+    desc: Build and start the full platform in the background
     cmds:
-      - docker compose up -d
+      - docker compose up -d --build
 
   down:
     desc: Stop and remove all containers and volumes
@@ -47,6 +47,18 @@ tasks:
     desc: Show running container status
     cmds:
       - docker compose ps
+
+  smoke:sb:
+    desc: Peek queued Service Bus topic messages from the local emulator
+    deps: [setup]
+    cmds:
+      - .venv/bin/python scripts/sb_peek.py market.raw --messages 3
+
+  smoke:ws:
+    desc: Subscribe to the API websocket and log the first live payload
+    deps: [setup]
+    cmds:
+      - .venv/bin/python scripts/ws_smoke.py --messages 1
 
   clean:
     desc: Remove .venv and all cache directories

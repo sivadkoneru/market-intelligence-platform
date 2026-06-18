@@ -42,6 +42,22 @@ def test_taskfile_exists():
     taskfile_path = repo_root / "Taskfile.yml"
     assert taskfile_path.exists(), "Taskfile.yml does not exist"
 
+    content = taskfile_path.read_text(encoding="utf-8")
+    assert "smoke:sb" in content
+    assert "smoke:ws" in content
+
+
+def test_makefile_exists_as_thin_wrapper():
+    """Assert Makefile exists for compatibility wrappers around task."""
+    repo_root = Path(__file__).parent.parent
+    makefile_path = repo_root / "Makefile"
+    assert makefile_path.exists(), "Makefile does not exist"
+
+    content = makefile_path.read_text(encoding="utf-8")
+    assert "task test" in content
+    assert "task smoke:sb" in content
+    assert "task smoke:ws" in content
+
 
 def test_claude_md_exists_and_has_disclaimer():
     """Assert CLAUDE.md exists and contains no-financial-advice language."""

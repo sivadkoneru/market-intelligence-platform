@@ -89,7 +89,7 @@ See `.env.example` at the repo root for all supported variables with safe local 
 | `GRAFANA_ADMIN_USER` | `admin` | Grafana admin username |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana admin password |
 
-Grafana installs the `marcusolsson-json-datasource` plugin at version `1.3.24` so the
+Grafana preinstalls the `marcusolsson-json-datasource` plugin at version `1.3.24` so the
 Druid SQL endpoint can be queried from provisioned dashboards without adding a
 custom image.
 

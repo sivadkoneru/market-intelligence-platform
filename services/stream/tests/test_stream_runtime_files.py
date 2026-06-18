@@ -16,6 +16,8 @@ def test_stream_requirements_are_pinned() -> None:
     assert "fastapi==0.115.6" in lines
     assert "azure-servicebus==7.12.3" in lines
     assert "redis==5.2.1" in lines
+    assert "tenacity==9.0.0" in lines
+    assert "elasticsearch==8.17.0" in lines
 
 
 def test_stream_dockerfile_uses_runtime_pattern() -> None:
