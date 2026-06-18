@@ -15,7 +15,9 @@ from libs.common.bus import (
 # ---------------------------------------------------------------------------
 
 
-async def _publish_and_receive(bus: InMemoryBus, topic: str, sub: str, body: dict) -> list[ReceivedMessage]:
+async def _publish_and_receive(
+    bus: InMemoryBus, topic: str, sub: str, body: dict
+) -> list[ReceivedMessage]:
     await bus.publish(topic, body)
     return await bus.receive(topic, sub)
 
