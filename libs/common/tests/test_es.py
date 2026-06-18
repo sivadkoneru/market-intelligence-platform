@@ -1,10 +1,16 @@
 """Tests for libs.common.es — InMemorySearchStore, cosine kNN, and factory."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
-from libs.common.es import InMemorySearchStore, _cosine_similarity, get_search_store
+from libs.common.es import (
+    ElasticsearchStore,
+    InMemorySearchStore,
+    _cosine_similarity,
+    get_search_store,
+)
 
 # ---------------------------------------------------------------------------
 # Cosine similarity utility
@@ -121,6 +127,20 @@ async def test_knn_score_included_in_result():
 
 
 @pytest.mark.asyncio
+async def test_in_memory_vector_index_validates_dimensions():
+    store = InMemorySearchStore()
+
+    await store.ensure_vector_index("v", dimensions=3)
+    await store.index_document("v", "ok", {"x": 1}, vector=[1.0, 0.0, 0.0])
+
+    with pytest.raises(ValueError, match="expected 3"):
+        await store.index_document("v", "bad", {"x": 2}, vector=[1.0, 0.0])
+
+    with pytest.raises(ValueError, match="expected 3"):
+        await store.knn_search("v", [1.0, 0.0], k=1)
+
+
+@pytest.mark.asyncio
 async def test_knn_ordering_hand_crafted_vectors():
     """
     Hand-built example where ranking is non-trivial:
@@ -150,3 +170,82 @@ async def test_knn_ordering_hand_crafted_vectors():
 def test_get_search_store_returns_in_memory_by_default():
     store = get_search_store()
     assert isinstance(store, InMemorySearchStore)
+
+
+# ---------------------------------------------------------------------------
+# ElasticsearchStore — vector index setup
+# ---------------------------------------------------------------------------
+
+
+class _FakeIndices:
+    def __init__(self, exists: bool, mapping: dict | None = None) -> None:
+        self.exists = self._exists
+        self.create_calls: list[dict] = []
+        self._exists_value = exists
+        self._mapping = mapping or {}
+
+    async def _exists(self, **kwargs):
+        return self._exists_value
+
+    async def create(self, **kwargs):
+        self.create_calls.append(dict(kwargs))
+
+    async def get_mapping(self, **kwargs):
+        return self._mapping
+
+
+def _elastic_store_with_indices(indices: _FakeIndices) -> ElasticsearchStore:
+    store = ElasticsearchStore.__new__(ElasticsearchStore)
+    store._es = SimpleNamespace(indices=indices)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_elasticsearch_store_creates_dense_vector_index():
+    indices = _FakeIndices(exists=False)
+    store = _elastic_store_with_indices(indices)
+
+    await store.ensure_vector_index("rag", dimensions=1536)
+
+    assert indices.create_calls == [
+        {
+            "index": "rag",
+            "mappings": {
+                "properties": {
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": 1536,
+                        "index": True,
+                        "similarity": "cosine",
+                    }
+                }
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_elasticsearch_store_validates_existing_dense_vector_index():
+    indices = _FakeIndices(
+        exists=True,
+        mapping={
+            "rag": {
+                "mappings": {
+                    "properties": {
+                        "embedding": {
+                            "type": "dense_vector",
+                            "dims": 16,
+                            "index": True,
+                            "similarity": "cosine",
+                        }
+                    }
+                }
+            }
+        },
+    )
+    store = _elastic_store_with_indices(indices)
+
+    await store.ensure_vector_index("rag", dimensions=16)
+
+    with pytest.raises(ValueError, match="found dense_vector with 16 cosine dimensions"):
+        await store.ensure_vector_index("rag", dimensions=32)

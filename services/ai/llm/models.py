@@ -20,7 +20,7 @@ class ContextDocument:
 
     @property
     def citation(self) -> str:
-        return self.url or self.doc_id
+        return self.url or str(self.metadata.get("citation") or self.doc_id)
 
 
 @dataclass(frozen=True)

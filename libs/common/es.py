@@ -55,6 +55,15 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 @runtime_checkable
 class SearchStore(Protocol):
+    async def ensure_vector_index(
+        self,
+        index: str,
+        dimensions: int,
+        similarity: str = "cosine",
+    ) -> None:
+        """Create or validate the vector index used by kNN search."""
+        ...
+
     async def index_document(
         self,
         index: str,
@@ -100,8 +109,36 @@ class InMemorySearchStore:
     def __init__(self) -> None:
         # index → doc_id → {"_doc": dict, "_vector": list[float] | None}
         self._indices: dict[str, dict[str, dict[str, Any]]] = {}
+        # index → {"dimensions": int, "similarity": str}
+        self._vector_indices: dict[str, dict[str, Any]] = {}
         # index → list[dict]  (append-only log store)
         self._logs: dict[str, list[dict[str, Any]]] = {}
+
+    async def ensure_vector_index(
+        self,
+        index: str,
+        dimensions: int,
+        similarity: str = "cosine",
+    ) -> None:
+        if dimensions <= 0:
+            raise ValueError("vector dimensions must be positive")
+        existing = self._vector_indices.get(index)
+        expected = {"dimensions": dimensions, "similarity": similarity}
+        if existing is not None and existing != expected:
+            raise ValueError(
+                f"Vector index {index!r} already configured as {existing}, expected {expected}"
+            )
+        self._vector_indices[index] = expected
+
+    def _validate_vector(self, index: str, vector: list[float]) -> None:
+        config = self._vector_indices.get(index)
+        if config is None:
+            return
+        expected = int(config["dimensions"])
+        if len(vector) != expected:
+            raise ValueError(
+                f"Vector for index {index!r} has {len(vector)} dimensions, expected {expected}"
+            )
 
     async def index_document(
         self,
@@ -110,6 +147,8 @@ class InMemorySearchStore:
         doc: dict[str, Any],
         vector: list[float] | None = None,
     ) -> None:
+        if vector is not None:
+            self._validate_vector(index, vector)
         self._indices.setdefault(index, {})[doc_id] = {
             "_doc": dict(doc),
             "_vector": vector,
@@ -127,6 +166,7 @@ class InMemorySearchStore:
         Result dicts contain all original fields plus ``_score`` and ``_id``.
         """
         store = self._indices.get(index, {})
+        self._validate_vector(index, query_vector)
         scored: list[tuple[float, str, dict[str, Any]]] = []
         for doc_id, entry in store.items():
             vec = entry.get("_vector")
@@ -177,6 +217,52 @@ class ElasticsearchStore:
         from elasticsearch import AsyncElasticsearch  # type: ignore
 
         self._es = AsyncElasticsearch([url])
+
+    async def ensure_vector_index(
+        self,
+        index: str,
+        dimensions: int,
+        similarity: str = "cosine",
+    ) -> None:
+        if dimensions <= 0:
+            raise ValueError("vector dimensions must be positive")
+
+        exists = await self._es.indices.exists(index=index)
+        if not exists:
+            await self._es.indices.create(
+                index=index,
+                mappings={
+                    "properties": {
+                        "embedding": {
+                            "type": "dense_vector",
+                            "dims": dimensions,
+                            "index": True,
+                            "similarity": similarity,
+                        }
+                    }
+                },
+            )
+            return
+
+        mapping = await self._es.indices.get_mapping(index=index)
+        index_mapping = mapping.get(index)
+        if index_mapping is None and mapping:
+            index_mapping = next(iter(mapping.values()))
+        properties = ((index_mapping or {}).get("mappings") or {}).get("properties") or {}
+        embedding = properties.get("embedding") or {}
+        actual_type = embedding.get("type")
+        actual_dimensions = int(embedding.get("dims", 0))
+        actual_similarity = embedding.get("similarity", similarity)
+        if (
+            actual_type != "dense_vector"
+            or actual_dimensions != dimensions
+            or actual_similarity != similarity
+        ):
+            raise ValueError(
+                f"Elasticsearch index {index!r} must define embedding dense_vector "
+                f"with {dimensions} {similarity} dimensions; found "
+                f"{actual_type} with {actual_dimensions} {actual_similarity} dimensions"
+            )
 
     async def index_document(
         self,

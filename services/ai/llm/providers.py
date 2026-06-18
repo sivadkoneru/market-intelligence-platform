@@ -368,6 +368,7 @@ class AzureOpenAIProvider(LLMProvider, EmbeddingProvider):
         response = await client.embeddings.create(
             model=self._embedding_deployment,
             input=list(request.texts),
+            dimensions=request.dimensions,
         )
         data = _get_attr(response, "data", [])
         vectors = tuple(tuple(float(x) for x in _get_attr(row, "embedding", ())) for row in data)

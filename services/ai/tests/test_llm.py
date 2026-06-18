@@ -104,6 +104,26 @@ def test_factory_defaults_to_mock_and_prefers_configured_providers() -> None:
     assert isinstance(bundle.embedder, AzureOpenAIProvider)
 
 
+def test_context_document_citation_prefers_url_then_metadata() -> None:
+    assert (
+        ContextDocument(
+            doc_id="doc-1",
+            url="https://example.test/doc-1",
+            text="one",
+            metadata={"citation": "source:feed"},
+        ).citation
+        == "https://example.test/doc-1"
+    )
+    assert (
+        ContextDocument(
+            doc_id="doc-2",
+            text="two",
+            metadata={"citation": "source:feed"},
+        ).citation
+        == "source:feed"
+    )
+
+
 def test_factory_honors_explicit_provider_selection_with_multiple_credentials() -> None:
     settings = Settings(
         mock_llm=False,
@@ -245,6 +265,7 @@ async def test_azure_provider_parses_fake_chat_and_embeddings() -> None:
     assert embeddings.vectors == ((0.1, 0.2, 0.3), (0.3, 0.2, 0.1))
     assert fake_client.chat_calls[0]["model"] == "gpt-test"
     assert fake_client.embedding_calls[0]["model"] == "embed-test"
+    assert fake_client.embedding_calls[0]["dimensions"] == 3
     assert isinstance(fake_client.chat_calls[0]["messages"], list)
 
 

@@ -274,6 +274,7 @@ from libs.common import get_search_store
 
 store = get_search_store()  # InMemorySearchStore offline
 
+await store.ensure_vector_index("articles", dimensions=1536)
 await store.index_document("articles", "doc1", {"title": "BTC pump"}, vector=[...])
 hits = await store.knn_search("articles", query_vector=[...], k=5)  # cosine-ranked
 await store.index_log("app-logs", {"level": "info", "msg": "started"})
@@ -281,8 +282,9 @@ results = await store.search("articles", {"query": {"match_all": {}}})
 ```
 
 **kNN:** `InMemorySearchStore` implements real cosine-similarity ranking (numpy when
-available, pure-Python fallback). `ElasticsearchStore` delegates to Elasticsearch `knn`
-dense-vector queries.
+available, pure-Python fallback). `ElasticsearchStore` creates or validates an
+`embedding` dense-vector mapping through `ensure_vector_index()` before delegating to
+Elasticsearch `knn` dense-vector queries.
 
 ---
 
