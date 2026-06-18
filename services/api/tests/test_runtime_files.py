@@ -18,6 +18,7 @@ def test_api_requirements_are_pinned() -> None:
     assert "redis==5.2.1" in lines
     assert "elasticsearch==8.17.0" in lines
     assert "tenacity==9.0.0" in lines
+    assert "websockets==13.1" in lines
 
 
 def test_api_dockerfile_uses_runtime_pattern() -> None:
@@ -35,6 +36,8 @@ def test_api_readmes_document_contract() -> None:
 
     assert "GET /market/{symbol}/latest" in readme
     assert "GET /insights/{symbol}" in readme
+    assert "WS /ws/stream" in readme
     assert "No financial advice" in readme
     assert "signals.py" in routes_readme
+    assert "services/api/ws.py" in routes_readme
     assert "No financial advice" in routes_readme

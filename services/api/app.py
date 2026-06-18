@@ -14,6 +14,7 @@ from services.api.routes.insights import router as insights_router
 from services.api.routes.market import router as market_router
 from services.api.routes.signals import router as signals_router
 from services.api.service import APIService
+from services.api.ws import router as ws_router
 
 
 def build_default_service() -> APIService:
@@ -63,6 +64,7 @@ def create_app(service: APIService | None = None) -> FastAPI:
                 "/signals",
                 "/alerts",
                 "/insights/{symbol}",
+                "/ws/stream",
             ],
         }
 
@@ -78,6 +80,7 @@ def create_app(service: APIService | None = None) -> FastAPI:
     app.include_router(signals_router)
     app.include_router(alerts_router)
     app.include_router(insights_router)
+    app.include_router(ws_router)
 
     return app
 

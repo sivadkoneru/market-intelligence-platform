@@ -50,11 +50,11 @@ Defined in `servicebus-config.json`, namespace `sbemulatorns`:
 
 | Topic | Subscriptions | Duplicate Detection |
 |---|---|---|
-| `market.raw` | `stream`, `api` | yes |
+| `market.raw` | `stream`, `api`, `api-ws` | yes |
 | `news.raw` | `ai` | no |
-| `signals` | `ai`, `alerting`, `api` | yes |
-| `insights` | `alerting`, `api` | no |
-| `alerts` | `api` | no |
+| `signals` | `ai`, `alerting`, `api`, `api-ws` | yes |
+| `insights` | `alerting`, `api`, `api-ws` | no |
+| `alerts` | `api`, `api-ws` | no |
 
 All subscriptions have `DeadLetteringOnMessageExpiration: true` and `MaxDeliveryCount: 5`.
 

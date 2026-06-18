@@ -4,19 +4,45 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
-from libs.common import InMemoryBus, InMemoryCache, InMemoryTimeSeriesStore
+from libs.common import (
+    TOPIC_ALERTS,
+    TOPIC_INSIGHTS,
+    TOPIC_MARKET_RAW,
+    TOPIC_SIGNALS,
+    InMemoryBus,
+    InMemoryCache,
+    InMemoryTimeSeriesStore,
+)
 from services.api.app import app, build_default_service, create_app
-from services.api.service import API_SUBSCRIPTION, APIService
+from services.api.service import API_SUBSCRIPTION, API_WS_SUBSCRIPTION, APIService
 
 
-class NoPrimeBus(InMemoryBus):
+class NoPrimeBus:
+    def __init__(self) -> None:
+        self.zero_message_receives: list[tuple[str, str]] = []
+
     async def receive(
         self,
         topic: str,
         subscription: str,
         max_messages: int = 10,
     ):
-        raise AssertionError("non-in-memory buses should not be primed with receive")
+        if max_messages == 0:
+            self.zero_message_receives.append((topic, subscription))
+            raise AssertionError("non-in-memory buses should not be primed with receive")
+        return []
+
+    async def complete(self, msg) -> None:
+        return None
+
+    async def dead_letter(self, msg, reason: str = "") -> None:
+        return None
+
+    async def peek(self, topic: str, subscription: str, n: int = 10):
+        return []
+
+    async def receive_dead_letter(self, topic: str, subscription: str):
+        return []
 
 
 class CloseRecordingBus(NoPrimeBus):
@@ -196,6 +222,16 @@ def _build_test_app() -> TestClient:
     return TestClient(create_app(service))
 
 
+def _build_ws_test_context() -> tuple[TestClient, APIService, InMemoryBus]:
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = InMemoryTimeSeriesStore()
+    _seed_store(store)
+    _seed_bus_and_cache(bus, cache)
+    service = APIService(store=store, cache=cache, bus=bus)
+    return TestClient(create_app(service)), service, bus
+
+
 def test_api_routes_return_populated_market_indicator_and_insight_payloads() -> None:
     with _build_test_app() as client:
         latest = client.get("/market/BTCUSDT/latest")
@@ -235,6 +271,7 @@ def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
     assert root.status_code == 200
     assert root.json()["message"] == "Portfolio project only. No financial advice. No real trades."
     assert "/insights/{symbol}" in root.json()["routes"]
+    assert "/ws/stream" in root.json()["routes"]
 
     assert health.status_code == 200
     assert health.json()["service"] == "api"
@@ -386,6 +423,110 @@ def test_api_returns_404s_and_validates_history_range() -> None:
     assert missing_indicators.status_code == 404
     assert missing_insight.status_code == 404
     assert bad_history.status_code == 400
+
+
+def test_ws_stream_validates_subscribe_payloads() -> None:
+    with _build_ws_test_context()[0] as client:
+        with client.websocket_connect("/ws/stream") as websocket:
+            websocket.send_json({"action": "follow", "symbols": ["BTCUSDT"]})
+            invalid_action = websocket.receive_json()
+            websocket.send_json({"action": "subscribe", "symbols": ["", " "]})
+            invalid_symbols = websocket.receive_json()
+            websocket.send_json({"action": "subscribe", "symbols": ["btcusdt"]})
+            valid = websocket.receive_json()
+
+    assert invalid_action["type"] == "error"
+    assert "subscribe" in invalid_action["detail"]
+    assert invalid_symbols["type"] == "error"
+    assert "non-empty symbol" in invalid_symbols["detail"]
+    assert valid == {"type": "subscribed", "symbols": ["BTCUSDT"]}
+
+
+def test_ws_stream_filters_by_symbol_and_fans_out_across_topics() -> None:
+    import asyncio
+
+    client, _, bus = _build_ws_test_context()
+
+    async def publish() -> None:
+        await bus.publish(
+            TOPIC_MARKET_RAW,
+            {
+                "event_id": "mkt-1",
+                "ts": datetime(2026, 1, 1, 0, 4, tzinfo=timezone.utc).isoformat(),
+                "symbol": "BTCUSDT",
+                "source": "replay.binance",
+                "event_type": "trade",
+                "price": 100500.0,
+                "volume": 0.5,
+            },
+            message_id="mkt-1",
+        )
+        await bus.publish(
+            TOPIC_SIGNALS,
+            {
+                "event_id": "sig-eth",
+                "ts": datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc).isoformat(),
+                "symbol": "ETHUSDT",
+                "source": "stream",
+                "indicators": {"rsi": 51.2},
+                "anomaly": False,
+            },
+            message_id="sig-eth",
+        )
+        await bus.publish(
+            TOPIC_ALERTS,
+            {
+                "event_id": "alt-2",
+                "ts": datetime(2026, 1, 1, 0, 6, tzinfo=timezone.utc).isoformat(),
+                "symbol": "BTCUSDT",
+                "rule": "breakout",
+                "severity": "high",
+                "message": "Breakout confirmed",
+                "dedupe_key": "btc-breakout",
+            },
+            message_id="alt-2",
+        )
+        await bus.publish(
+            TOPIC_INSIGHTS,
+            _insight_payload("ins-2", "BTCUSDT"),
+            message_id="ins-2",
+        )
+
+    with client:
+        with client.websocket_connect("/ws/stream") as websocket:
+            websocket.send_json({"action": "subscribe", "symbols": ["BTCUSDT"]})
+            assert websocket.receive_json() == {"type": "subscribed", "symbols": ["BTCUSDT"]}
+
+            asyncio.run(publish())
+
+            received = [websocket.receive_json() for _ in range(3)]
+
+    assert {message["type"] for message in received} == {"market", "alert", "insight"}
+    assert all(message["symbol"] == "BTCUSDT" for message in received)
+    assert {message["payload"]["event_id"] for message in received} == {"mkt-1", "alt-2", "ins-2"}
+    api_signals = asyncio.run(bus.peek(TOPIC_SIGNALS, API_SUBSCRIPTION, n=10))
+    ws_signals = asyncio.run(bus.peek(TOPIC_SIGNALS, API_WS_SUBSCRIPTION, n=10))
+    assert any(message.message_id == "sig-eth" for message in api_signals)
+    assert all(message.message_id != "sig-eth" for message in ws_signals)
+
+
+def test_ws_stream_disconnect_cleans_up_connection_registration() -> None:
+    import time
+
+    client, service, _ = _build_ws_test_context()
+
+    with client:
+        assert service.active_stream_connections == 0
+        with client.websocket_connect("/ws/stream") as websocket:
+            websocket.send_json({"action": "subscribe", "symbols": ["BTCUSDT"]})
+            assert websocket.receive_json() == {"type": "subscribed", "symbols": ["BTCUSDT"]}
+            assert service.active_stream_connections == 1
+
+        deadline = time.time() + 0.5
+        while time.time() < deadline and service.active_stream_connections != 0:
+            time.sleep(0.01)
+
+        assert service.active_stream_connections == 0
 
 
 def test_module_level_app_uses_offline_default_service() -> None:

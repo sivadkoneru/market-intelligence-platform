@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,10 +12,12 @@ from typing import Any
 from libs.common import (
     TOPIC_ALERTS,
     TOPIC_INSIGHTS,
+    TOPIC_MARKET_RAW,
     TOPIC_SIGNALS,
     Alert,
     Cache,
     Insight,
+    MarketEvent,
     MessageBus,
     Signal,
     TimeSeriesStore,
@@ -22,8 +25,173 @@ from libs.common import (
 )
 
 API_SUBSCRIPTION = "api"
+API_WS_SUBSCRIPTION = "api-ws"
 INSIGHT_CACHE_PREFIX = "insight"
 INSIGHT_BUS_FALLBACK_LIMIT = 1_000
+STREAM_POLL_INTERVAL_SECONDS = 0.05
+TopicModel = type[MarketEvent] | type[Signal] | type[Alert] | type[Insight]
+
+
+@dataclass(frozen=True)
+class StreamEnvelope:
+    topic: str
+    event: str
+    symbol: str
+    payload: dict[str, Any]
+
+
+@dataclass
+class StreamSubscriber:
+    symbols: set[str]
+    queue: asyncio.Queue[dict[str, Any]]
+
+
+class LiveStreamBroker:
+    """Bus-backed live stream fanout shared across websocket clients."""
+
+    def __init__(
+        self,
+        *,
+        bus: MessageBus,
+        subscription: str = API_WS_SUBSCRIPTION,
+        poll_interval_seconds: float = STREAM_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        self._bus = bus
+        self._subscription = subscription
+        self._poll_interval_seconds = poll_interval_seconds
+        self._log = get_logger(__name__)
+        self._subscribers: dict[str, StreamSubscriber] = {}
+        self._tasks: list[asyncio.Task[None]] = []
+        self._started = False
+        self._stop_event = asyncio.Event()
+        self._topics: tuple[tuple[str, str, TopicModel], ...] = (
+            (TOPIC_MARKET_RAW, "market", MarketEvent),
+            (TOPIC_SIGNALS, "signal", Signal),
+            (TOPIC_ALERTS, "alert", Alert),
+            (TOPIC_INSIGHTS, "insight", Insight),
+        )
+
+    @property
+    def active_connections(self) -> int:
+        return len(self._subscribers)
+
+    async def start(self, *, prime_subscription: bool) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._stop_event.clear()
+        if prime_subscription:
+            for topic, _, _ in self._topics:
+                await self._bus.receive(topic, self._subscription, max_messages=0)
+        self._tasks = [
+            asyncio.create_task(
+                self._pump_topic(topic=topic, event_name=event_name, model=model),
+                name=f"api-stream-{topic}",
+            )
+            for topic, event_name, model in self._topics
+        ]
+
+    async def close(self) -> None:
+        self._stop_event.set()
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        self._subscribers.clear()
+        self._started = False
+
+    def register(self, connection_id: str) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscribers[connection_id] = StreamSubscriber(symbols=set(), queue=queue)
+        return queue
+
+    def update_symbols(self, connection_id: str, symbols: Sequence[str]) -> list[str]:
+        subscriber = self._subscribers[connection_id]
+        subscriber.symbols = {symbol.strip().upper() for symbol in symbols if symbol.strip()}
+        return sorted(subscriber.symbols)
+
+    def unregister(self, connection_id: str) -> None:
+        self._subscribers.pop(connection_id, None)
+
+    def _has_active_subscriptions(self) -> bool:
+        return any(subscriber.symbols for subscriber in self._subscribers.values())
+
+    async def _pump_topic(
+        self,
+        *,
+        topic: str,
+        event_name: str,
+        model: TopicModel,
+    ) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if not self._has_active_subscriptions():
+                    await asyncio.sleep(self._poll_interval_seconds)
+                    continue
+
+                messages = await self._bus.receive(
+                    topic,
+                    self._subscription,
+                    max_messages=25,
+                )
+                if not messages:
+                    await asyncio.sleep(self._poll_interval_seconds)
+                    continue
+
+                for message in messages:
+                    envelope = self._build_envelope(
+                        message=message,
+                        topic=topic,
+                        event_name=event_name,
+                        model=model,
+                    )
+                    if envelope is not None:
+                        await self._fanout(envelope)
+                    await self._bus.complete(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.warning(
+                    "api.stream_broker_receive_failed",
+                    topic=topic,
+                    subscription=self._subscription,
+                    error=str(exc),
+                )
+                await asyncio.sleep(self._poll_interval_seconds)
+
+    def _build_envelope(
+        self,
+        *,
+        message: Any,
+        topic: str,
+        event_name: str,
+        model: TopicModel,
+    ) -> StreamEnvelope | None:
+        try:
+            payload = model.model_validate(message.body).model_dump(mode="json")
+        except Exception:
+            self._log.warning(
+                "api.invalid_stream_message_skipped",
+                topic=topic,
+                subscription=self._subscription,
+                message_id=getattr(message, "message_id", ""),
+                model=model.__name__,
+            )
+            return None
+        symbol = str(payload["symbol"]).upper()
+        return StreamEnvelope(topic=topic, event=event_name, symbol=symbol, payload=payload)
+
+    async def _fanout(self, envelope: StreamEnvelope) -> None:
+        message = {
+            "type": envelope.event,
+            "topic": envelope.topic,
+            "symbol": envelope.symbol,
+            "payload": envelope.payload,
+        }
+        for subscriber in list(self._subscribers.values()):
+            if envelope.symbol in subscriber.symbols:
+                await subscriber.queue.put(message)
 
 
 def _backend_name(obj: object) -> str:
@@ -99,6 +267,7 @@ class APIService:
         self._subscription = subscription
         self.metrics = APIMetrics()
         self._log = get_logger(__name__)
+        self._stream_broker = LiveStreamBroker(bus=bus)
 
     @property
     def timeseries_backend(self) -> str:
@@ -113,12 +282,13 @@ class APIService:
         return _backend_name(self._bus)
 
     async def prime_subscriptions(self) -> None:
-        if self.bus_backend != "inmemorybus":
-            return
-        for topic in (self._signal_topic, self._alert_topic, self._insight_topic):
-            await self._bus.receive(topic, self._subscription, max_messages=0)
+        if self.bus_backend == "inmemorybus":
+            for topic in (self._signal_topic, self._alert_topic, self._insight_topic):
+                await self._bus.receive(topic, self._subscription, max_messages=0)
+        await self._stream_broker.start(prime_subscription=self.bus_backend == "inmemorybus")
 
     async def close(self) -> None:
+        await self._stream_broker.close()
         for backend in (self._cache, self._bus):
             close = getattr(backend, "close", None)
             if close is None:
@@ -254,6 +424,19 @@ class APIService:
             cache_backend=self.cache_backend,
             bus_backend=self.bus_backend,
         )
+
+    @property
+    def active_stream_connections(self) -> int:
+        return self._stream_broker.active_connections
+
+    def register_stream(self, connection_id: str) -> asyncio.Queue[dict[str, Any]]:
+        return self._stream_broker.register(connection_id)
+
+    def subscribe_stream(self, connection_id: str, symbols: Sequence[str]) -> list[str]:
+        return self._stream_broker.update_symbols(connection_id, symbols)
+
+    def unregister_stream(self, connection_id: str) -> None:
+        self._stream_broker.unregister(connection_id)
 
     async def _rows_for_tables(self, tables: Sequence[str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

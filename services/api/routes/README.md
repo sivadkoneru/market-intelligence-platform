@@ -9,6 +9,7 @@ Portfolio project only. No financial advice and no real trades.
 - Keep the REST surface grouped by feature area
 - Reuse the shared `APIService` dependency instead of embedding storage logic in endpoints
 - Make the future `WS /ws/stream` addition straightforward without reshaping the app
+- Keep the REST surface separate from the websocket module in `services/api/ws.py`
 
 ## Modules
 
@@ -16,6 +17,7 @@ Portfolio project only. No financial advice and no real trades.
 - `signals.py` - latest signal feed snapshots
 - `alerts.py` - latest alerts feed snapshots
 - `insights.py` - latest insight per symbol
+- `services/api/ws.py` - live websocket stream with subscribe-by-symbol fanout
 
 ## Dependencies
 

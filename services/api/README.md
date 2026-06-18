@@ -12,6 +12,7 @@ Portfolio project only. No financial advice and no real trades.
 - Serve latest market snapshots and historical market rows
 - Serve latest indicators per symbol from the stream cache and time-series store
 - Surface latest `signals`, `alerts`, and `insights`
+- Stream live market, signal, alert, and insight events over `WS /ws/stream`
 - Keep the default runtime offline-safe by resolving to in-memory fakes when live infra
   is not configured
 
@@ -27,6 +28,7 @@ Portfolio project only. No financial advice and no real trades.
 - `GET /signals`
 - `GET /alerts`
 - `GET /insights/{symbol}`
+- `WS /ws/stream`
 
 Run locally:
 
@@ -61,3 +63,5 @@ await service.prime_subscriptions()
   rows from the time-series store.
 - Insights are served from the cached `insight:{symbol}` payload first, then from the
   message bus peek path as a fallback.
+- WebSocket clients send `{"action":"subscribe","symbols":["BTCUSDT"]}` and then
+  receive live `market`, `signal`, `alert`, and `insight` messages for matching symbols.

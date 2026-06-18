@@ -174,11 +174,20 @@ class TestComposeServices:
 # ---------------------------------------------------------------------------
 
 EXPECTED_TOPICS = {
-    "market.raw": {"subscriptions": {"stream", "api"}, "duplicate_detection": True},
+    "market.raw": {
+        "subscriptions": {"stream", "api", "api-ws"},
+        "duplicate_detection": True,
+    },
     "news.raw": {"subscriptions": {"ai"}, "duplicate_detection": False},
-    "signals": {"subscriptions": {"ai", "alerting", "api"}, "duplicate_detection": True},
-    "insights": {"subscriptions": {"alerting", "api"}, "duplicate_detection": False},
-    "alerts": {"subscriptions": {"api"}, "duplicate_detection": False},
+    "signals": {
+        "subscriptions": {"ai", "alerting", "api", "api-ws"},
+        "duplicate_detection": True,
+    },
+    "insights": {
+        "subscriptions": {"alerting", "api", "api-ws"},
+        "duplicate_detection": False,
+    },
+    "alerts": {"subscriptions": {"api", "api-ws"}, "duplicate_detection": False},
 }
 
 
