@@ -6,7 +6,6 @@ import pytest
 
 from libs.common.es import InMemorySearchStore, _cosine_similarity, get_search_store
 
-
 # ---------------------------------------------------------------------------
 # Cosine similarity utility
 # ---------------------------------------------------------------------------

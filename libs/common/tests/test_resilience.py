@@ -1,7 +1,6 @@
 """Tests for libs.common.resilience — retry helper and circuit breaker."""
 
 import pytest
-import pytest_asyncio
 from tenacity import RetryError
 
 from libs.common.resilience import (
@@ -11,7 +10,6 @@ from libs.common.resilience import (
     retry_async,
     with_retry,
 )
-
 
 # ---------------------------------------------------------------------------
 # Retry helpers

@@ -4,7 +4,6 @@ import pytest
 
 from libs.common.redis_client import InMemoryCache, get_cache
 
-
 # ---------------------------------------------------------------------------
 # Basic set / get / delete
 # ---------------------------------------------------------------------------
