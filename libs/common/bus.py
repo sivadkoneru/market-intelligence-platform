@@ -254,21 +254,26 @@ class ServiceBusBus:
         # topic → sender  (each sender is recreated per publish — senders are
         # lightweight and the async-with pattern closes them on exit)
         self._senders: dict[str, Any] = {}
-        # (topic, subscription) → open ServiceBusReceiver
-        self._receivers: dict[tuple[str, str], Any] = {}
+        # (topic, subscription, sub_queue) → open ServiceBusReceiver
+        self._receivers: dict[tuple[str, str, str | None], Any] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_receiver(self, topic: str, subscription: str) -> Any:
+    def _get_receiver(
+        self,
+        topic: str,
+        subscription: str,
+        sub_queue: str | None = None,
+    ) -> Any:
         """Return a cached open receiver, creating it lazily."""
-        key = (topic, subscription)
+        key = (topic, subscription, sub_queue)
         if key not in self._receivers:
-            self._receivers[key] = self._client.get_subscription_receiver(
-                topic_name=topic,
-                subscription_name=subscription,
-            )
+            kwargs = {"topic_name": topic, "subscription_name": subscription}
+            if sub_queue is not None:
+                kwargs["sub_queue"] = sub_queue
+            self._receivers[key] = self._client.get_subscription_receiver(**kwargs)
         return self._receivers[key]
 
     # ------------------------------------------------------------------
@@ -373,26 +378,22 @@ class ServiceBusBus:
     ) -> list[ReceivedMessage]:
         import json
 
-        receiver = self._client.get_subscription_receiver(
-            topic_name=topic,
-            subscription_name=subscription,
-            sub_queue="deadletter",
-        )
+        receiver = self._get_receiver(topic, subscription, sub_queue="deadletter")
         msgs: list[ReceivedMessage] = []
-        async with receiver:
-            received = await receiver.receive_messages(max_message_count=100, max_wait_time=5)
-            for raw in received:
-                body = json.loads(bytes(raw.body))
-                msgs.append(
-                    ReceivedMessage(
-                        topic=topic,
-                        subscription=subscription,
-                        body=body,
-                        message_id=str(raw.message_id or ""),
-                        correlation_id=str(raw.correlation_id or ""),
-                        _dlq=True,
-                    )
+        received = await receiver.receive_messages(max_message_count=100, max_wait_time=5)
+        for raw in received:
+            body = json.loads(bytes(raw.body))
+            msgs.append(
+                ReceivedMessage(
+                    topic=topic,
+                    subscription=subscription,
+                    body=body,
+                    message_id=str(raw.message_id or ""),
+                    correlation_id=str(raw.correlation_id or ""),
+                    _queue_ref=_SBMessageRef(raw=raw, receiver=receiver),
+                    _dlq=True,
                 )
+            )
         return msgs
 
     # ------------------------------------------------------------------

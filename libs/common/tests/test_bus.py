@@ -199,9 +199,10 @@ def test_get_message_bus_returns_in_memory_by_default():
 class _FakeReceiver:
     """Fake ServiceBusReceiver that records settlement calls without Azure."""
 
-    def __init__(self) -> None:
+    def __init__(self, received: list | None = None) -> None:
         self.completed: list = []
         self.dead_lettered: list = []
+        self.received = received or []
 
     async def complete_message(self, raw_msg) -> None:
         self.completed.append(raw_msg)
@@ -209,12 +210,32 @@ class _FakeReceiver:
     async def dead_letter_message(self, raw_msg, *, reason: str = "") -> None:
         self.dead_lettered.append((raw_msg, reason))
 
+    async def receive_messages(self, **kwargs):
+        return list(self.received)
+
 
 class _FakeRawMessage:
     """Minimal stand-in for ServiceBusReceivedMessage."""
 
-    def __init__(self, mid: str = "msg-1") -> None:
+    def __init__(
+        self,
+        mid: str = "msg-1",
+        body: bytes = b'{"v": 1}',
+        correlation_id: str | None = "corr-1",
+    ) -> None:
         self.message_id = mid
+        self.body = body
+        self.correlation_id = correlation_id
+
+
+class _FakeServiceBusClient:
+    def __init__(self, receiver: _FakeReceiver) -> None:
+        self.receiver = receiver
+        self.receiver_calls: list[dict] = []
+
+    def get_subscription_receiver(self, **kwargs):
+        self.receiver_calls.append(dict(kwargs))
+        return self.receiver
 
 
 def _make_servicebus_bus_with_fake_receiver(
@@ -231,7 +252,7 @@ def _make_servicebus_bus_with_fake_receiver(
     bus._receivers = {}
     # Inject the fake receiver
     fake_receiver = _FakeReceiver()
-    bus._receivers[(topic, subscription)] = fake_receiver
+    bus._receivers[(topic, subscription, None)] = fake_receiver
     return bus, fake_receiver
 
 
@@ -274,6 +295,34 @@ async def test_servicebus_dead_letter_calls_receiver_dead_letter_message():
     settled_raw, settled_reason = fake_rx.dead_lettered[0]
     assert settled_raw is raw, "dead_letter_message was not called with the raw message"
     assert settled_reason == "poison pill"
+
+
+@pytest.mark.asyncio
+async def test_servicebus_receive_dead_letter_keeps_receiver_for_settlement():
+    raw = _FakeRawMessage("id-dlq", body=b'{"bad": true}')
+    fake_rx = _FakeReceiver(received=[raw])
+    fake_client = _FakeServiceBusClient(fake_rx)
+    bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._client = fake_client
+
+    messages = await bus.receive_dead_letter("topic", "sub")
+
+    assert len(messages) == 1
+    assert messages[0].body == {"bad": True}
+    assert messages[0]._dlq is True
+    assert fake_client.receiver_calls == [
+        {
+            "topic_name": "topic",
+            "subscription_name": "sub",
+            "sub_queue": "deadletter",
+        }
+    ]
+
+    await bus.complete(messages[0])
+
+    assert fake_rx.completed == [raw]
 
 
 @pytest.mark.asyncio

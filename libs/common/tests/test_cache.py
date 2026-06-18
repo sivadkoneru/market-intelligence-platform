@@ -31,6 +31,29 @@ async def test_delete():
     assert await cache.get("k") is None
 
 
+@pytest.mark.asyncio
+async def test_set_if_absent_writes_only_first_value():
+    cache = InMemoryCache()
+
+    first = await cache.set_if_absent("lock", "first")
+    second = await cache.set_if_absent("lock", "second")
+
+    assert first is True
+    assert second is False
+    assert await cache.get("lock") == "first"
+
+
+@pytest.mark.asyncio
+async def test_set_if_absent_respects_ttl():
+    now = [0.0]
+    cache = InMemoryCache(time_fn=lambda: now[0])
+
+    assert await cache.set_if_absent("lock", "first", ttl=10) is True
+    now[0] = 10.1
+    assert await cache.set_if_absent("lock", "second") is True
+    assert await cache.get("lock") == "second"
+
+
 # ---------------------------------------------------------------------------
 # TTL expiry (via injected clock — no sleeping)
 # ---------------------------------------------------------------------------

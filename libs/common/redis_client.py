@@ -39,6 +39,14 @@ class Cache(Protocol):
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         ...
 
+    async def set_if_absent(
+        self,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> bool:
+        ...
+
     async def delete(self, key: str) -> None:
         ...
 
@@ -90,6 +98,17 @@ class InMemoryCache:
         else:
             self._expiry.pop(key, None)
 
+    async def set_if_absent(
+        self,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> bool:
+        if await self.get(key) is not None:
+            return False
+        await self.set(key, value, ttl=ttl)
+        return True
+
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
         self._expiry.pop(key, None)
@@ -140,6 +159,17 @@ class RedisCache:
             await self._client.setex(key, ttl, serialised)
         else:
             await self._client.set(key, serialised)
+
+    async def set_if_absent(
+        self,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> bool:
+        import pickle
+
+        serialised = pickle.dumps(value)
+        return bool(await self._client.set(key, serialised, ex=ttl, nx=True))
 
     async def delete(self, key: str) -> None:
         await self._client.delete(key)

@@ -230,6 +230,9 @@ for msg in msgs:
     # or: await bus.dead_letter(msg, reason="parse error")
 
 dlq = await bus.receive_dead_letter("market.raw", "stream-sub")
+for msg in dlq:
+    await bus.publish(msg.topic, msg.body, message_id=f"{msg.message_id}:replay")
+    await bus.complete(msg)          # settle original DLQ message after replay
 peeked = await bus.peek("market.raw", "stream-sub", n=5)
 ```
 
@@ -251,6 +254,10 @@ snap = await cache.get_snapshot("BTCUSDT")
 # Idempotency
 if not await cache.seen("event-id-xyz"):
     process_event()  # first time only
+
+# Short-lived processing lock
+if await cache.set_if_absent("lock:event-id-xyz", True, ttl=300):
+    process_event()
 ```
 
 ### druid.py — Time-Series Store (Apache Druid)
