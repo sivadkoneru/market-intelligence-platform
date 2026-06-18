@@ -1,10 +1,29 @@
 """
-libs.common — shared event schema, config, and structured logging.
+libs.common — shared event schema, config, structured logging, and infra clients.
 
 Re-exports the public API so services can import directly from ``libs.common``.
 """
 
+from libs.common.bus import (
+    InMemoryBus,
+    MessageBus,
+    ReceivedMessage,
+    ServiceBusBus,
+    get_message_bus,
+)
 from libs.common.config import Settings, get_settings
+from libs.common.druid import (
+    DruidClient,
+    InMemoryTimeSeriesStore,
+    TimeSeriesStore,
+    get_timeseries_store,
+)
+from libs.common.es import (
+    ElasticsearchStore,
+    InMemorySearchStore,
+    SearchStore,
+    get_search_store,
+)
 from libs.common.logging import (
     bind_context,
     bind_correlation_id,
@@ -12,6 +31,19 @@ from libs.common.logging import (
     configure_logging,
     get_logger,
     reset_context,
+)
+from libs.common.redis_client import (
+    Cache,
+    InMemoryCache,
+    RedisCache,
+    get_cache,
+)
+from libs.common.resilience import (
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
+    retry_async,
+    with_retry,
 )
 from libs.common.schema import (
     TOPIC_ALERTS,
@@ -54,4 +86,31 @@ __all__ = [
     "bind_trace_id",
     "bind_context",
     "reset_context",
+    # Resilience
+    "CircuitBreaker",
+    "CircuitOpenError",
+    "CircuitState",
+    "retry_async",
+    "with_retry",
+    # Message bus (Service Bus port)
+    "MessageBus",
+    "InMemoryBus",
+    "ServiceBusBus",
+    "ReceivedMessage",
+    "get_message_bus",
+    # Cache (Redis port)
+    "Cache",
+    "InMemoryCache",
+    "RedisCache",
+    "get_cache",
+    # Time-series store (Druid port)
+    "TimeSeriesStore",
+    "InMemoryTimeSeriesStore",
+    "DruidClient",
+    "get_timeseries_store",
+    # Search / vector store (Elasticsearch port)
+    "SearchStore",
+    "InMemorySearchStore",
+    "ElasticsearchStore",
+    "get_search_store",
 ]
