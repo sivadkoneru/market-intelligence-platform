@@ -32,3 +32,12 @@ def test_exchanges_directory_has_readme() -> None:
 
     assert readme.exists()
     assert "Binance" in readme.read_text(encoding="utf-8")
+
+
+def test_sources_directory_has_readme() -> None:
+    readme = SERVICE_ROOT / "sources" / "README.md"
+
+    assert readme.exists()
+    text = readme.read_text(encoding="utf-8")
+    assert "news.raw" in text
+    assert "RSS" in text

@@ -19,6 +19,21 @@ from services.ingestion.replay import (
     build_replay_feed_factory,
 )
 from services.ingestion.service import IngestionMetrics, IngestionService
+from services.ingestion.sources import (
+    DEFAULT_NEWS_SYMBOLS,
+    NewsCollector,
+    NewsFetcher,
+    NewsPollingMetrics,
+    NewsPollingService,
+    RestSocialCollector,
+    RssCollector,
+    RssFeed,
+    SocialFeed,
+    coerce_datetime,
+    extract_symbols,
+    hash_news_event,
+    normalize_symbols,
+)
 
 __all__ = [
     "create_app",
@@ -33,6 +48,19 @@ __all__ = [
     "COINBASE_WS_URL",
     "CoinbaseWebSocketClient",
     "normalize_market_payload",
+    "DEFAULT_NEWS_SYMBOLS",
+    "NewsCollector",
+    "NewsFetcher",
+    "NewsPollingMetrics",
+    "NewsPollingService",
+    "RssFeed",
+    "RssCollector",
+    "SocialFeed",
+    "RestSocialCollector",
+    "coerce_datetime",
+    "extract_symbols",
+    "hash_news_event",
+    "normalize_symbols",
     "DeterministicReplayFeed",
     "ReplayDisconnectError",
     "build_replay_feed_factory",
