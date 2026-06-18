@@ -5,18 +5,32 @@ A multi-service Python platform that ingests live crypto market data and news/so
 ## Quick Start
 
 ```bash
-# Set up the local test environment
-task setup
-task test
-
-# Start the entire platform
 cp .env.example .env
 task up
+```
 
-# Smoke helpers
+For the local test loop:
+
+```bash
+task setup
+task lint
+task test
+```
+
+Smoke helpers:
+
+```bash
 task smoke:sb
 task smoke:ws
 ```
+
+## Links
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [API](docs/API.md)
+- [Benchmarks](docs/BENCHMARKS.md)
+- [Azure production notes](docs/AZURE_PRODUCTION.md)
+- [API service README](services/api/README.md)
 
 See `CLAUDE.md` for the full codebase guide, architecture conventions, and commit rules.
 
@@ -50,41 +64,47 @@ This platform is **NOT** for:
 
 The platform is runnable entirely offline with mock data. No real capital is at risk.
 
+## Current Ports
+
+- API: `http://localhost:8000` and container port `8005`
+- Ingestion: `8001`
+- Stream: `8002`
+- AI analysis: `8003`
+- Alerting: `8004`
+- Grafana: `3000`
+- Druid: `8888`
+- PostgreSQL: `5432`
+- Redis: `6379`
+- Elasticsearch: `9200`
+- Service Bus emulator: `5672` and `5300`
+- SQL Server: `1433`
+- ZooKeeper: `2181`
+
 ## Architecture
 
 See `docs/ARCHITECTURE.md` for system design, data flow diagrams, and component descriptions (when available).
 
-## Testing
+## Commands
 
 ```bash
-task test          # Run pytest suite
-task clean         # Remove venv and caches
-make test          # Thin wrapper around task test
-```
-
-## Development
-
-### Setup and Build Commands
-
-```bash
-task setup         # Create .venv and install all dev dependencies
-task test          # Run pytest suite (auto-runs setup if needed)
-task lint          # Check code style with ruff
-task format        # Format code with black and ruff
-task up            # Build and start infra + all five app services
+task setup         # Create .venv with Python 3.11 and install dev dependencies
+task lint          # Ruff gate
+task test          # Pytest gate
+task format        # Black + ruff format pass
+task up            # Build and start infra + app services
 task down          # Stop containers and remove volumes
 task ps            # Show compose status
 task smoke:sb      # Peek Service Bus topic messages
 task smoke:ws      # Subscribe to the API websocket smoke stream
-task clean         # Remove .venv and all cache directories
+task clean         # Remove .venv and cache directories
 ```
 
 `make setup`, `make test`, and the other top-level targets are thin wrappers around the
 same `task` commands for environments that expect `make`.
 
-### Stack
+## Stack
 
-- **Language**: Python 3.12 (local dev with Python 3.11 venv for compatibility)
+- **Language**: Python 3.12 (local dev and CI use Python 3.11 for the test environment)
 - **Async**: asyncio throughout
 - **API**: FastAPI + Uvicorn
 - **Messaging**: Azure Service Bus (with local emulator)

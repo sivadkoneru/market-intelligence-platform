@@ -1,0 +1,40 @@
+trigger:
+  branches:
+    include:
+      - "*"
+
+pr:
+  branches:
+    include:
+      - "*"
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  PYTHON_VERSION: "3.11"
+
+steps:
+  - checkout: self
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: "$(PYTHON_VERSION)"
+      addToPath: true
+
+  - script: |
+      python --version
+      python -m venv .venv
+      .venv/bin/python -m pip install --upgrade pip
+      .venv/bin/python -m pip install -r requirements-dev.txt
+    displayName: Install Python dependencies
+
+  - script: |
+      docker compose config -q
+    displayName: Validate docker-compose.yml
+
+  - script: .venv/bin/ruff check .
+    displayName: Ruff lint
+
+  - script: .venv/bin/pytest -q
+    displayName: Pytest
