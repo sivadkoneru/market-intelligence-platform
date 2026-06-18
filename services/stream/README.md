@@ -1,61 +1,76 @@
 # Stream Service
 
-Computes deterministic technical indicators for market price streams. This module is pure and offline-friendly so later stream processors can reuse the same math in tests and in message handling code.
+Consumes `market.raw`, computes deterministic technical indicators per symbol, ingests
+tick and indicator rows into the time-series store, caches the latest snapshot, and
+publishes `signals`. The service is offline-safe by default because it uses the shared
+`MessageBus`, `Cache`, and `TimeSeriesStore` ports from `libs/common`, which resolve to
+in-memory fakes when live infrastructure is not configured.
 
-## Indicators
+Portfolio project only. No financial advice and no real trades.
 
-- SMA
-- EMA
-- RSI
-- Rolling volatility
-- Trend detection
-- Z-score anomaly detection
-- EWMA anomaly detection
+## Purpose
+
+- Subscribe to `market.raw` with the `stream` subscription
+- Convert message payloads into common `MarketEvent` objects
+- Maintain in-process per-symbol price history
+- Compute SMA, EMA, RSI, rolling volatility, trend, z-score anomaly, and EWMA anomaly
+- Ingest tick rows and indicator rows into the time-series store
+- Cache the latest per-symbol snapshot
+- Publish `Signal` events to `signals`
+- Suppress duplicate inputs with the common market event idempotency key
+- Dead-letter malformed payloads with a useful reason
 
 ## Inputs
 
-- Ordered price series as Python sequences of numeric values
-- Integer window or period arguments for rolling calculations
-- Positive anomaly thresholds for z-score and EWMA checks
-
-For `rolling_volatility`, baseline prices used as return denominators must be strictly positive.
+- `market.raw` topic messages whose bodies validate as `libs.common.MarketEvent`
+- Ordered per-symbol prices retained in memory while the worker is running
 
 ## Outputs
 
-- `float` for SMA, EMA, RSI, and rolling volatility when enough data is available
-- `str` trend labels: `uptrend`, `downtrend`, or `flat`
-- `bool` anomaly flags for z-score and EWMA detection
-- `None` when the input series does not yet contain enough data for the requested calculation
+- `ticks` rows in the `TimeSeriesStore`
+- `indicators` rows in the `TimeSeriesStore`
+- Redis-style latest snapshots via `Cache.set_snapshot(symbol, data)`
+- `signals` topic events built from `libs.common.Signal`
+- Dead-letter entries for malformed or poison messages
 
-For anomaly detection, if the baseline variance is zero, the threshold is interpreted as an absolute delta from the baseline mean rather than a normalized score.
+## Runtime Endpoints
+
+- `GET /health`
+- `GET /metrics`
+
+Run locally:
+
+```bash
+uvicorn services.stream.app:app --host 0.0.0.0 --port 8002
+```
 
 ## Dependencies
 
 - Python standard library
 - `numpy`
+- `fastapi`
+- `structlog`
+- Shared offline-safe ports from `libs/common`
 
-No network, storage, clocks, randomness, or live infrastructure are involved.
+No secrets, network calls, or live infrastructure are required for tests.
 
 ## Usage
 
 ```python
-from services.stream.indicators import (
-    detect_trend,
-    exponential_moving_average,
-    relative_strength_index,
-    rolling_volatility,
-    simple_moving_average,
-)
+from libs.common import InMemoryBus, InMemoryCache, InMemoryTimeSeriesStore
+from services.stream.service import StreamService
 
-prices = [100.0, 101.0, 102.5, 104.0, 103.5]
+bus = InMemoryBus()
+cache = InMemoryCache()
+store = InMemoryTimeSeriesStore()
 
-sma = simple_moving_average(prices, window=3)
-ema = exponential_moving_average(prices, window=3)
-rsi = relative_strength_index(prices, period=4)
-volatility = rolling_volatility(prices, window=5)
-trend = detect_trend(prices, window=5)
+service = StreamService(bus=bus, cache=cache, store=store)
+await bus.receive("market.raw", "stream", max_messages=0)  # prime the subscription in tests
+await service.poll_once()
 ```
 
-All functions are deterministic, perform no I/O, and return `None` when there is not enough data yet for the requested calculation.
+## Indicator Helpers
 
-Portfolio project only. No financial advice and no real trades.
+The pure math helpers remain in `services.stream.indicators` and are reused by the
+message-handling path. They return `None` until enough price history exists for the
+requested calculation.

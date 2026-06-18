@@ -1,10 +1,11 @@
-"""Tests for libs.common.druid — InMemoryTimeSeriesStore and factory."""
+"""Tests for libs.common.druid — InMemoryTimeSeriesStore, DruidClient, and factory."""
 
+import json
 from datetime import datetime
 
 import pytest
 
-from libs.common.druid import InMemoryTimeSeriesStore, get_timeseries_store
+from libs.common.druid import DruidClient, InMemoryTimeSeriesStore, get_timeseries_store
 
 
 def _ts(year: int, month: int, day: int, hour: int = 0) -> datetime:
@@ -128,6 +129,56 @@ async def test_query_sql_count():
     await store.ingest([{"symbol": "X", "ts": _ts(2024, 1, 1), "p": 1}] * 7)
     result = await store.query_sql('SELECT COUNT(*) FROM "ticks"')
     assert result[0]["EXPR$0"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Druid ingest spec builder
+# ---------------------------------------------------------------------------
+
+
+def test_build_ingest_specs_splits_mixed_tables_and_strips_table_field():
+    rows = [
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": "2024-01-01T00:00:00Z", "price": 1.0},
+        {
+            "_table": "indicators",
+            "symbol": "BTCUSDT",
+            "ts": "2024-01-01T00:00:00Z",
+            "sma": 1.1,
+        },
+    ]
+
+    specs = DruidClient._build_ingest_specs(rows)
+
+    assert len(specs) == 2
+    by_source = {spec["spec"]["dataSchema"]["dataSource"]: spec for spec in specs}
+    assert set(by_source) == {"ticks", "indicators"}
+    assert "_table" not in by_source["ticks"]["spec"]["dataSchema"]["dimensionsSpec"]["dimensions"]
+    assert (
+        "_table"
+        not in by_source["indicators"]["spec"]["dataSchema"]["dimensionsSpec"]["dimensions"]
+    )
+
+    tick_data = by_source["ticks"]["spec"]["ioConfig"]["inputSource"]["data"].splitlines()
+    indicator_data = by_source["indicators"]["spec"]["ioConfig"]["inputSource"]["data"].splitlines()
+    assert "_table" not in json.loads(tick_data[0])
+    assert "_table" not in json.loads(indicator_data[0])
+
+
+def test_build_ingest_specs_defaults_rows_without_table_to_ticks():
+    rows = [{"symbol": "ETHUSDT", "ts": "2024-01-01T00:00:00Z", "price": 2.0}]
+
+    specs = DruidClient._build_ingest_specs(rows)
+
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec["spec"]["dataSchema"]["dataSource"] == "ticks"
+    payload = json.loads(spec["spec"]["ioConfig"]["inputSource"]["data"])
+    assert payload["symbol"] == "ETHUSDT"
+    assert "_table" not in payload
+
+
+def test_build_ingest_specs_empty_rows_is_noop():
+    assert DruidClient._build_ingest_specs([]) == []
 
 
 # ---------------------------------------------------------------------------

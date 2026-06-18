@@ -12,6 +12,8 @@ get_timeseries_store()  — Factory.
 from __future__ import annotations
 
 import copy
+import json
+from collections import defaultdict
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -175,41 +177,63 @@ class DruidClient:
     def __init__(self, url: str) -> None:
         self._base_url = url.rstrip("/")
 
+    @staticmethod
+    def _build_ingest_specs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        grouped_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            table = row.get("_table", "ticks")
+            clean_row = copy.deepcopy(row)
+            clean_row.pop("_table", None)
+            grouped_rows[table].append(clean_row)
+
+        specs: list[dict[str, Any]] = []
+        for table, table_rows in grouped_rows.items():
+            dimensions = list((table_rows[0] if table_rows else {}).keys())
+            specs.append(
+                {
+                    "type": "index_parallel",
+                    "spec": {
+                        "dataSchema": {
+                            "dataSource": table,
+                            "timestampSpec": {"column": "ts", "format": "auto"},
+                            "dimensionsSpec": {"dimensions": dimensions},
+                            "granularitySpec": {"rollup": False},
+                        },
+                        "ioConfig": {
+                            "type": "index_parallel",
+                            "inputSource": {
+                                "type": "inline",
+                                "data": "\n".join(json.dumps(r) for r in table_rows),
+                            },
+                            "inputFormat": {"type": "json"},
+                        },
+                    },
+                }
+            )
+        return specs
+
     async def ingest(self, rows: list[dict[str, Any]]) -> None:
         """
         Submit rows to Druid via an inline-data ingestion spec.
         For a real deployment this would POST a native batch spec.
         """
-        import json
-
         import httpx
 
-        spec = {
-            "type": "index_parallel",
-            "spec": {
-                "dataSchema": {
-                    "dataSource": "ticks",
-                    "timestampSpec": {"column": "ts", "format": "auto"},
-                    "dimensionsSpec": {"dimensions": list((rows[0] if rows else {}).keys())},
-                    "granularitySpec": {"rollup": False},
-                },
-                "ioConfig": {
-                    "type": "index_parallel",
-                    "inputSource": {
-                        "type": "inline",
-                        "data": "\n".join(json.dumps(r) for r in rows),
-                    },
-                    "inputFormat": {"type": "json"},
-                },
-            },
-        }
+        specs = self._build_ingest_specs(rows)
+        if not specs:
+            return
+
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{self._base_url}/druid/indexer/v1/task",
-                json=spec,
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
+            for spec in specs:
+                resp = await client.post(
+                    f"{self._base_url}/druid/indexer/v1/task",
+                    json=spec,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
 
     async def query_sql(self, sql: str) -> list[dict[str, Any]]:
         import httpx
