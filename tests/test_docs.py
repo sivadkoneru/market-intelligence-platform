@@ -11,6 +11,7 @@ REQUIRED_DOCS = [
     DOCS_ROOT / "ARCHITECTURE.md",
     DOCS_ROOT / "SEQUENCE.md",
     DOCS_ROOT / "API.md",
+    DOCS_ROOT / "BENCHMARKS.md",
     DOCS_ROOT / "AZURE_PRODUCTION.md",
     ADRS_ROOT / "README.md",
     ADRS_ROOT / "0001-service-bus-emulator-topology.md",
@@ -66,6 +67,19 @@ def test_api_doc_matches_current_route_surface() -> None:
     ):
         assert route in content
     assert "ws://localhost:8000/ws/stream" in content
+
+
+def test_benchmarks_doc_covers_harness_and_limitations() -> None:
+    content = _read(DOCS_ROOT / "BENCHMARKS.md")
+
+    assert "scripts/bench.py" in content
+    assert "--events 100" in content
+    assert "p50" in content
+    assert "p95" in content
+    assert "p99" in content
+    assert "Docker" in content
+    assert "This is not a live infrastructure benchmark." in content
+    assert "Results exclude Docker, Azure Service Bus, Redis, Druid, Elasticsearch" in content
 
 
 def test_adr_directory_has_readme_and_records() -> None:
