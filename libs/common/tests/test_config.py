@@ -13,6 +13,8 @@ def test_settings_defaults_offline():
         "ELASTICSEARCH_URL",
         "POSTGRES_DSN",
         "MOCK_LLM",
+        "LLM_PROVIDER",
+        "EMBEDDING_PROVIDER",
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "ANTHROPIC_API_KEY",
@@ -26,6 +28,8 @@ def test_settings_defaults_offline():
 
         s = Settings()
         assert s.mock_llm is True
+        assert s.llm_provider == "auto"
+        assert s.embedding_provider == "auto"
         assert s.log_level == "INFO"
         assert s.service_name == "market-intel"
         # All optional secrets default to None or empty string — just confirm no exception
@@ -41,6 +45,8 @@ def test_settings_env_override(monkeypatch):
     monkeypatch.setenv("SERVICE_NAME", "test-service")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("MOCK_LLM", "false")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "azure_openai")
 
     # Force re-import to pick up env changes
     import importlib
@@ -52,6 +58,8 @@ def test_settings_env_override(monkeypatch):
     assert s.service_name == "test-service"
     assert s.log_level == "DEBUG"
     assert s.mock_llm is False
+    assert s.llm_provider == "anthropic"
+    assert s.embedding_provider == "azure_openai"
 
 
 def test_get_settings_returns_settings_instance():
