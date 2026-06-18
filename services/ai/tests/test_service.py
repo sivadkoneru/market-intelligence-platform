@@ -306,7 +306,10 @@ def test_app_health_and_metrics_endpoints() -> None:
     with TestClient(test_app) as client:
         root = client.get("/")
         health = client.get("/health")
-        metrics = client.get("/metrics")
+        metrics = client.get(
+            "/metrics",
+            headers={"X-Correlation-ID": "ai-corr", "X-Trace-ID": "ai-trace"},
+        )
 
     assert root.status_code == 200
     assert root.json()["service"] == "ai-analysis"
@@ -314,7 +317,10 @@ def test_app_health_and_metrics_endpoints() -> None:
     assert health.status_code == 200
     assert health.json()["service"] == "ai-analysis"
     assert metrics.status_code == 200
+    assert metrics.headers["X-Correlation-ID"] == "ai-corr"
+    assert metrics.headers["X-Trace-ID"] == "ai-trace"
     assert "ai_messages_seen" in metrics.text
+    assert "ai_http_requests_total 2" in metrics.text
 
 
 def test_module_level_app_uses_offline_default_service() -> None:

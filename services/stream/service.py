@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
@@ -16,6 +16,7 @@ from libs.common import (
     TOPIC_MARKET_RAW,
     TOPIC_SIGNALS,
     Cache,
+    HTTPMetrics,
     MarketEvent,
     MessageBus,
     ReceivedMessage,
@@ -61,6 +62,26 @@ class StreamMetrics:
     tick_rows_ingested: int = 0
     indicator_rows_ingested: int = 0
     last_error: str | None = None
+    http: HTTPMetrics = field(default_factory=HTTPMetrics)
+
+    def record_http_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        trace_context_provided: bool,
+        correlation_context_provided: bool,
+    ) -> None:
+        self.http.record_http_request(
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            trace_context_provided=trace_context_provided,
+            correlation_context_provided=correlation_context_provided,
+        )
 
     def render(self) -> str:
         lines = [
@@ -79,6 +100,7 @@ class StreamMetrics:
             "# TYPE stream_indicator_rows_ingested counter",
             f"stream_indicator_rows_ingested {self.indicator_rows_ingested}",
         ]
+        lines.extend(self.http.render("stream"))
         return "\n".join(lines) + "\n"
 
 

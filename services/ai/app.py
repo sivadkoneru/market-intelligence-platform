@@ -11,7 +11,15 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-from libs.common import configure_logging, get_cache, get_message_bus, get_search_store
+from libs.common import (
+    configure_logging,
+    configure_new_relic,
+    get_cache,
+    get_message_bus,
+    get_search_store,
+    get_settings,
+    install_observability,
+)
 from services.ai.llm import get_provider_bundle
 from services.ai.rag import RAGPipeline
 from services.ai.service import AIAnalysisService
@@ -38,7 +46,15 @@ def create_app(
     *,
     run_on_startup: bool = True,
 ) -> FastAPI:
-    configure_logging()
+    settings = get_settings()
+    search_store = get_search_store(settings)
+    configure_logging(
+        level=settings.log_level,
+        service_name="ai",
+        search_store=search_store,
+        log_index=settings.elasticsearch_log_index,
+    )
+    configure_new_relic(settings, service_name="ai")
     resolved_service = service or build_default_service()
 
     @asynccontextmanager
@@ -66,6 +82,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.ai_service = resolved_service
+    install_observability(app, service_name="ai", metrics=resolved_service.metrics)
 
     @app.get("/")
     async def root() -> dict[str, object]:

@@ -11,7 +11,14 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-from libs.common import configure_logging, get_message_bus
+from libs.common import (
+    configure_logging,
+    configure_new_relic,
+    get_message_bus,
+    get_search_store,
+    get_settings,
+    install_observability,
+)
 from services.ingestion.replay import DeterministicReplayFeed, build_default_replay_events
 from services.ingestion.service import IngestionService
 
@@ -30,7 +37,14 @@ def create_app(
     run_on_startup: bool = True,
     startup_max_events: int | None = None,
 ) -> FastAPI:
-    configure_logging()
+    settings = get_settings()
+    configure_logging(
+        level=settings.log_level,
+        service_name="ingestion",
+        search_store=get_search_store(settings),
+        log_index=settings.elasticsearch_log_index,
+    )
+    configure_new_relic(settings, service_name="ingestion")
     resolved_service = service or build_default_service()
 
     @asynccontextmanager
@@ -60,6 +74,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.ingestion_service = resolved_service
+    install_observability(app, service_name="ingestion", metrics=resolved_service.metrics)
 
     @app.get("/health")
     async def health() -> dict[str, object]:

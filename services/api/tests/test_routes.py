@@ -262,7 +262,10 @@ def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
     with _build_test_app() as client:
         root = client.get("/")
         health = client.get("/health")
-        metrics = client.get("/metrics")
+        metrics = client.get(
+            "/metrics",
+            headers={"X-Correlation-ID": "api-corr", "X-Trace-ID": "api-trace"},
+        )
         symbols = client.get("/symbols")
         history = client.get("/market/BTCUSDT/history", params={"from": start, "to": end})
         signals = client.get("/signals")
@@ -278,8 +281,11 @@ def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
     assert health.json()["backends"]["timeseries"] == "inmemorytimeseries"
 
     assert metrics.status_code == 200
+    assert metrics.headers["X-Correlation-ID"] == "api-corr"
+    assert metrics.headers["X-Trace-ID"] == "api-trace"
     assert "api_structured_logging_json 1" in metrics.text
     assert 'api_backend_info{kind="cache",backend="inmemorycache"} 1' in metrics.text
+    assert "api_http_requests_total 2" in metrics.text
 
     assert symbols.status_code == 200
     assert symbols.json() == {"symbols": ["BTCUSDT", "ETHUSDT"], "count": 2}
@@ -306,6 +312,7 @@ def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
     assert "api_requests_total 2" in metrics_after.text
     assert "api_symbols_requests 1" in metrics_after.text
     assert "api_market_latest_requests 1" in metrics_after.text
+    assert "api_http_requests_total 2" in metrics_after.text
 
 
 def test_indicators_fall_back_to_timeseries_when_cache_is_empty() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import isawaitable
 from typing import Any
@@ -16,6 +16,7 @@ from libs.common import (
     TOPIC_SIGNALS,
     Alert,
     Cache,
+    HTTPMetrics,
     Insight,
     MarketEvent,
     MessageBus,
@@ -209,6 +210,26 @@ class APIMetrics:
     signals_requests: int = 0
     alerts_requests: int = 0
     insights_requests: int = 0
+    http: HTTPMetrics = field(default_factory=HTTPMetrics)
+
+    def record_http_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        trace_context_provided: bool,
+        correlation_context_provided: bool,
+    ) -> None:
+        self.http.record_http_request(
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            trace_context_provided=trace_context_provided,
+            correlation_context_provided=correlation_context_provided,
+        )
 
     def render(
         self,
@@ -241,6 +262,7 @@ class APIMetrics:
             f'api_backend_info{{kind="cache",backend="{cache_backend}"}} 1',
             f'api_backend_info{{kind="bus",backend="{bus_backend}"}} 1',
         ]
+        lines.extend(self.http.render("api"))
         return "\n".join(lines) + "\n"
 
 

@@ -14,7 +14,7 @@ package — no per-service duplicate event models.
 |---|---|
 | `schema.py` | Pydantic v2 event models + topic constants + idempotency key helper |
 | `config.py` | `pydantic-settings` `Settings` with offline-safe defaults and `get_settings()` |
-| `logging.py` | structlog JSON logger with correlation/trace ID propagation via `contextvars` |
+| `logging.py` | structlog JSON logger, FastAPI request observability middleware, ES log sink, optional New Relic bootstrap |
 
 ---
 
@@ -131,7 +131,16 @@ print(settings.mock_llm)    # True by default (no LLM keys required)
 ### Logging
 
 ```python
-from libs.common import configure_logging, get_logger, bind_correlation_id, bind_trace_id
+from fastapi import FastAPI
+
+from libs.common import (
+    configure_logging,
+    configure_new_relic,
+    get_logger,
+    bind_correlation_id,
+    bind_trace_id,
+    install_observability,
+)
 
 configure_logging(level="INFO")   # JSON to stdout; idempotent
 bind_correlation_id("req-abc")
@@ -142,6 +151,10 @@ log.info("ingestion.start", symbol="BTCUSDT")
 # → {"event": "ingestion.start", "symbol": "BTCUSDT",
 #    "correlation_id": "req-abc", "trace_id": "trace-xyz",
 #    "level": "info", "logger": "...", "timestamp": "..."}
+
+app = FastAPI()
+install_observability(app, service_name="api", metrics=my_metrics)
+configure_new_relic(settings, service_name="api")  # no-op without config/module
 ```
 
 ---

@@ -232,7 +232,10 @@ def test_app_health_and_metrics_endpoints() -> None:
     with TestClient(test_app) as client:
         root = client.get("/")
         health = client.get("/health")
-        metrics = client.get("/metrics")
+        metrics = client.get(
+            "/metrics",
+            headers={"X-Correlation-ID": "stream-corr", "X-Trace-ID": "stream-trace"},
+        )
 
     assert root.status_code == 200
     assert root.json()["service"] == "stream"
@@ -240,7 +243,10 @@ def test_app_health_and_metrics_endpoints() -> None:
     assert health.status_code == 200
     assert health.json()["service"] == "stream"
     assert metrics.status_code == 200
+    assert metrics.headers["X-Correlation-ID"] == "stream-corr"
+    assert metrics.headers["X-Trace-ID"] == "stream-trace"
     assert "stream_messages_seen" in metrics.text
+    assert "stream_http_requests_total 2" in metrics.text
 
 
 def test_module_level_app_uses_offline_default_service() -> None:

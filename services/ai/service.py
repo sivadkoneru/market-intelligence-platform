@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
@@ -18,6 +18,7 @@ from libs.common import (
     TOPIC_NEWS_RAW,
     TOPIC_SIGNALS,
     Cache,
+    HTTPMetrics,
     Insight,
     MessageBus,
     NewsEvent,
@@ -187,6 +188,26 @@ class AIMetrics:
     signal_contexts_indexed: int = 0
     dead_lettered: int = 0
     last_error: str | None = None
+    http: HTTPMetrics = field(default_factory=HTTPMetrics)
+
+    def record_http_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        trace_context_provided: bool,
+        correlation_context_provided: bool,
+    ) -> None:
+        self.http.record_http_request(
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            trace_context_provided=trace_context_provided,
+            correlation_context_provided=correlation_context_provided,
+        )
 
     def render(self) -> str:
         lines = [
@@ -209,6 +230,7 @@ class AIMetrics:
             "# TYPE ai_dead_lettered counter",
             f"ai_dead_lettered {self.dead_lettered}",
         ]
+        lines.extend(self.http.render("ai"))
         return "\n".join(lines) + "\n"
 
 

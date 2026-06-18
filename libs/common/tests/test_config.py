@@ -19,6 +19,10 @@ def test_settings_defaults_offline():
         "AZURE_OPENAI_ENDPOINT",
         "ANTHROPIC_API_KEY",
         "NEW_RELIC_LICENSE_KEY",
+        "NEW_RELIC_CONFIG_FILE",
+        "NEW_RELIC_APP_NAME",
+        "NEW_RELIC_ENVIRONMENT",
+        "ELASTICSEARCH_LOG_INDEX",
         "LOG_LEVEL",
         "SERVICE_NAME",
     ]
@@ -32,6 +36,10 @@ def test_settings_defaults_offline():
         assert s.embedding_provider == "auto"
         assert s.log_level == "INFO"
         assert s.service_name == "market-intel"
+        assert s.new_relic_config_file is None
+        assert s.new_relic_app_name is None
+        assert s.new_relic_environment is None
+        assert s.elasticsearch_log_index is None
         # All optional secrets default to None or empty string — just confirm no exception
         assert s.azure_openai_api_key is None or isinstance(s.azure_openai_api_key, str)
     finally:
@@ -47,6 +55,8 @@ def test_settings_env_override(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "false")
     monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     monkeypatch.setenv("EMBEDDING_PROVIDER", "azure_openai")
+    monkeypatch.setenv("ELASTICSEARCH_LOG_INDEX", "logs-custom")
+    monkeypatch.setenv("NEW_RELIC_APP_NAME", "nr-app")
 
     # Force re-import to pick up env changes
     import importlib
@@ -60,6 +70,8 @@ def test_settings_env_override(monkeypatch):
     assert s.mock_llm is False
     assert s.llm_provider == "anthropic"
     assert s.embedding_provider == "azure_openai"
+    assert s.elasticsearch_log_index == "logs-custom"
+    assert s.new_relic_app_name == "nr-app"
 
 
 def test_get_settings_returns_settings_instance():

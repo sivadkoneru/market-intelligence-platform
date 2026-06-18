@@ -25,11 +25,15 @@ from libs.common.es import (
     get_search_store,
 )
 from libs.common.logging import (
+    HTTPMetrics,
     bind_context,
     bind_correlation_id,
     bind_trace_id,
     configure_logging,
+    configure_new_relic,
+    create_observability_middleware,
     get_logger,
+    install_observability,
     reset_context,
 )
 from libs.common.redis_client import (
@@ -81,10 +85,14 @@ __all__ = [
     "get_settings",
     # Logging
     "configure_logging",
+    "configure_new_relic",
     "get_logger",
+    "HTTPMetrics",
     "bind_correlation_id",
     "bind_trace_id",
     "bind_context",
+    "create_observability_middleware",
+    "install_observability",
     "reset_context",
     # Resilience
     "CircuitBreaker",

@@ -11,6 +11,7 @@ from typing import Any
 
 from libs.common import (
     TOPIC_MARKET_RAW,
+    HTTPMetrics,
     MessageBus,
     get_logger,
     market_event_key,
@@ -31,7 +32,27 @@ class IngestionMetrics:
     reconnects: int = 0
     disconnects: int = 0
     last_error: str | None = None
+    http: HTTPMetrics = field(default_factory=HTTPMetrics)
     published_message_ids: set[str] = field(default_factory=set)
+
+    def record_http_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        trace_context_provided: bool,
+        correlation_context_provided: bool,
+    ) -> None:
+        self.http.record_http_request(
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            trace_context_provided=trace_context_provided,
+            correlation_context_provided=correlation_context_provided,
+        )
 
     def render(self) -> str:
         lines = [
@@ -50,6 +71,7 @@ class IngestionMetrics:
             "# TYPE ingestion_disconnects counter",
             f"ingestion_disconnects {self.disconnects}",
         ]
+        lines.extend(self.http.render("ingestion"))
         return "\n".join(lines) + "\n"
 
 

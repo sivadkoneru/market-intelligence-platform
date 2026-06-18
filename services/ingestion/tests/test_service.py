@@ -88,12 +88,18 @@ def test_app_health_and_metrics_endpoints() -> None:
 
     with TestClient(app) as client:
         health = client.get("/health")
-        metrics = client.get("/metrics")
+        metrics = client.get(
+            "/metrics",
+            headers={"X-Correlation-ID": "ingestion-corr", "X-Trace-ID": "ingestion-trace"},
+        )
 
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
     assert metrics.status_code == 200
+    assert metrics.headers["X-Correlation-ID"] == "ingestion-corr"
+    assert metrics.headers["X-Trace-ID"] == "ingestion-trace"
     assert "ingestion_events_seen" in metrics.text
+    assert "ingestion_http_requests_total 1" in metrics.text
 
 
 def test_app_lifespan_starts_replay_ingestion() -> None:

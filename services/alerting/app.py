@@ -9,7 +9,15 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-from libs.common import configure_logging, get_cache, get_message_bus
+from libs.common import (
+    configure_logging,
+    configure_new_relic,
+    get_cache,
+    get_message_bus,
+    get_search_store,
+    get_settings,
+    install_observability,
+)
 from services.alerting.service import AlertingService
 
 
@@ -26,7 +34,14 @@ def create_app(
     *,
     run_on_startup: bool = True,
 ) -> FastAPI:
-    configure_logging()
+    settings = get_settings()
+    configure_logging(
+        level=settings.log_level,
+        service_name="alerting",
+        search_store=get_search_store(settings),
+        log_index=settings.elasticsearch_log_index,
+    )
+    configure_new_relic(settings, service_name="alerting")
     resolved_service = service or build_default_service()
 
     @asynccontextmanager
@@ -54,6 +69,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.alerting_service = resolved_service
+    install_observability(app, service_name="alerting", metrics=resolved_service.metrics)
 
     @app.get("/")
     async def root() -> dict[str, object]:

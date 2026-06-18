@@ -285,14 +285,20 @@ def test_app_endpoints_and_module_app() -> None:
     with TestClient(local_app) as client:
         root = client.get("/")
         health = client.get("/health")
-        metrics = client.get("/metrics")
+        metrics = client.get(
+            "/metrics",
+            headers={"X-Correlation-ID": "alerting-corr", "X-Trace-ID": "alerting-trace"},
+        )
 
     assert root.status_code == 200
     assert "No financial advice" in root.json()["message"]
     assert health.status_code == 200
     assert health.json()["service"] == "alerting"
     assert metrics.status_code == 200
+    assert metrics.headers["X-Correlation-ID"] == "alerting-corr"
+    assert metrics.headers["X-Trace-ID"] == "alerting-trace"
     assert "alerting_messages_seen" in metrics.text
+    assert "alerting_http_requests_total 2" in metrics.text
 
     with TestClient(app) as client:
         assert client.get("/health").json()["service"] == "alerting"

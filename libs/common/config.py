@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Observability
     # -------------------------------------------------------------------------
     new_relic_license_key: Optional[str] = None
+    new_relic_config_file: Optional[str] = None
+    new_relic_app_name: Optional[str] = None
+    new_relic_environment: Optional[str] = None
+    elasticsearch_log_index: Optional[str] = None
 
     # -------------------------------------------------------------------------
     # Service identity / logging
