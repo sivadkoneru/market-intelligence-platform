@@ -19,6 +19,8 @@ No financial advice. No real trades. This repository is a portfolio project.
 ## Modules
 
 - `app.py` — FastAPI app factory
+- `exchanges/` — reusable Binance/Coinbase WebSocket clients with reconnect,
+  circuit breaker, heartbeat tracking, and `market.raw` publishing
 - `normalizer.py` — replay/Binance/Coinbase payload normalization
 - `replay.py` — deterministic async replay feed with optional simulated disconnect
 - `service.py` — publish loop to `market.raw` with deterministic message ids
@@ -49,5 +51,6 @@ uvicorn services.ingestion.app:app --host 0.0.0.0 --port 8001
 ## Dependencies
 
 Pinned in `requirements.txt`: FastAPI, Uvicorn, Pydantic v2, pydantic-settings,
-structlog, Azure Service Bus, and orjson. Tests use the root development
-requirements and the in-memory bus; no network or secrets are required.
+structlog, Azure Service Bus, websockets, and orjson. Tests use the root
+development requirements and the in-memory bus; no network or secrets are
+required.

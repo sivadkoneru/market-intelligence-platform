@@ -15,6 +15,7 @@ def test_ingestion_requirements_are_pinned() -> None:
     assert all("==" in line for line in lines)
     assert "fastapi==0.115.6" in lines
     assert "azure-servicebus==7.12.3" in lines
+    assert "websockets==13.1" in lines
 
 
 def test_ingestion_dockerfile_uses_runtime_pattern() -> None:
@@ -24,3 +25,10 @@ def test_ingestion_dockerfile_uses_runtime_pattern() -> None:
     assert "USER appuser" in dockerfile
     assert "services.ingestion.app:app" in dockerfile
     assert "EXPOSE 8001" in dockerfile
+
+
+def test_exchanges_directory_has_readme() -> None:
+    readme = SERVICE_ROOT / "exchanges" / "README.md"
+
+    assert readme.exists()
+    assert "Binance" in readme.read_text(encoding="utf-8")
