@@ -172,7 +172,7 @@ All pinned in `/requirements-dev.txt`:
 | `python-dateutil` | 2.9.0.post0 | Timestamp parsing in InMemoryTimeSeriesStore |
 | `httpx` | 0.28.1 | DruidClient HTTP calls |
 
-No heavy framework dependencies (LangChain, OpenAI, etc.) are required for `make test` —
+No heavy framework dependencies (LangChain, OpenAI, etc.) are required for `task test` —
 those are import-guarded in service packages.
 
 ---

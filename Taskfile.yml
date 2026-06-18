@@ -1,0 +1,58 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  setup:
+    desc: Create .venv (python3.11) and install pinned dev dependencies (idempotent)
+    cmds:
+      - python3.11 -m venv .venv
+      - .venv/bin/python -m pip install -U pip
+      - .venv/bin/python -m pip install -r requirements-dev.txt
+    status:
+      - test -f .venv/bin/python
+
+  test:
+    desc: Run pytest suite (THE quality gate — must stay green)
+    deps: [setup]
+    cmds:
+      - .venv/bin/python -m pytest -q
+
+  lint:
+    desc: Check code style with ruff
+    cmds:
+      - .venv/bin/ruff check .
+
+  format:
+    desc: Format code with black and ruff
+    cmds:
+      - .venv/bin/black .
+      - .venv/bin/ruff check --fix .
+
+  up:
+    desc: Start all infrastructure services in the background
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Stop and remove all containers and volumes
+    cmds:
+      - docker compose down -v
+
+  ps:
+    desc: Show running container status
+    cmds:
+      - docker compose ps
+
+  clean:
+    desc: Remove .venv and all cache directories
+    cmds:
+      - rm -rf .venv .pytest_cache .ruff_cache .mypy_cache __pycache__ *.egg-info dist build
+      - find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+      - find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+      - find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
+      - find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true

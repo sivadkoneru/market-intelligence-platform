@@ -20,13 +20,13 @@ cp .env.example .env
 # Edit .env if you need non-default credentials
 
 # Start all infra services in the background
-make up
+task up
 
 # Check status
-make ps
+task ps
 
 # Tear down (removes volumes too)
-make down
+task down
 ```
 
 Services take ~30–90 s to reach healthy state. The SB emulator and Druid are the slowest to initialise.

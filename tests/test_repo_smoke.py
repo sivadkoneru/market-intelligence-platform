@@ -36,11 +36,21 @@ def test_readme_has_disclaimer():
     assert "no financial advice" in content, "README.md missing 'no financial advice' phrase"
 
 
-def test_makefile_exists():
-    """Assert Makefile exists."""
+def test_taskfile_exists():
+    """Assert Taskfile.yml exists (migrated from Makefile)."""
     repo_root = Path(__file__).parent.parent
-    makefile_path = repo_root / "Makefile"
-    assert makefile_path.exists(), "Makefile does not exist"
+    taskfile_path = repo_root / "Taskfile.yml"
+    assert taskfile_path.exists(), "Taskfile.yml does not exist"
+
+
+def test_claude_md_exists_and_has_disclaimer():
+    """Assert CLAUDE.md exists and contains no-financial-advice language."""
+    repo_root = Path(__file__).parent.parent
+    claude_md_path = repo_root / "CLAUDE.md"
+    assert claude_md_path.exists(), "CLAUDE.md does not exist"
+
+    content = claude_md_path.read_text(encoding="utf-8").lower()
+    assert "no financial advice" in content, "CLAUDE.md missing 'no financial advice' phrase"
 
 
 def test_gitignore_exists():

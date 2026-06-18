@@ -6,12 +6,14 @@ A multi-service Python platform that ingests live crypto market data and news/so
 
 ```bash
 # Set up the local test environment
-make setup
-make test
+task setup
+task test
 
 # Start the entire platform (when compose file is ready)
 docker compose up -d
 ```
+
+See `CLAUDE.md` for the full codebase guide, architecture conventions, and commit rules.
 
 ## Layout
 
@@ -50,8 +52,8 @@ See `docs/ARCHITECTURE.md` for system design, data flow diagrams, and component 
 ## Testing
 
 ```bash
-make test          # Run pytest suite
-make clean         # Remove venv and caches
+task test          # Run pytest suite
+task clean         # Remove venv and caches
 ```
 
 ## Development
@@ -59,11 +61,11 @@ make clean         # Remove venv and caches
 ### Setup and Build Commands
 
 ```bash
-make setup         # Create .venv and install all dev dependencies
-make test          # Run pytest suite (auto-runs setup if needed)
-make lint          # Check code style with ruff
-make format        # Format code with black and ruff
-make clean         # Remove .venv and all cache directories
+task setup         # Create .venv and install all dev dependencies
+task test          # Run pytest suite (auto-runs setup if needed)
+task lint          # Check code style with ruff
+task format        # Format code with black and ruff
+task clean         # Remove .venv and all cache directories
 ```
 
 ### Stack
