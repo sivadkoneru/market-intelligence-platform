@@ -10,7 +10,9 @@ Holds config files for all local infrastructure services defined in `docker-comp
 
 - `servicebus-config.json` — Azure Service Bus emulator namespace/topic/subscription topology
 - `druid/environment` — Apache Druid runtime environment variables (metadata, ZK, storage, memory)
-- `grafana/provisioning/` — Grafana provisioned datasources and dashboards (populated in T17)
+- `grafana/provisioning/` — Grafana provisioned datasources and dashboards:
+  Elasticsearch logs, Druid HTTP JSON datasource, and the
+  `Market Intelligence Observability` dashboard
 
 ## Bringing Infrastructure Up
 
@@ -42,7 +44,7 @@ Services take ~30–90 s to reach healthy state. The SB emulator and Druid are t
 | `druid` | `apache/druid:30.0.0` | 8888 | Time-series analytics (micro-quickstart profile) |
 | `redis` | `redis:7` | 6379 | Caching, latest-value snapshots, idempotency keys |
 | `elasticsearch` | `docker.elastic.co/elasticsearch/elasticsearch:8.17.0` | 9200 | Structured log store + RAG vector search (kNN) |
-| `grafana` | `grafana/grafana:11.3.0` | 3000 | Operational dashboards |
+| `grafana` | `grafana/grafana:11.3.0` | 3000 | Operational dashboards, provisioned datasources, and dashboards |
 
 ## Service Bus Topics and Subscriptions
 
@@ -86,6 +88,10 @@ See `.env.example` at the repo root for all supported variables with safe local 
 | `POSTGRES_DB` | `mip` | Default database name |
 | `GRAFANA_ADMIN_USER` | `admin` | Grafana admin username |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana admin password |
+
+Grafana installs the `marcusolsson-json-datasource` plugin at version `1.3.24` so the
+Druid SQL endpoint can be queried from provisioned dashboards without adding a
+custom image.
 
 ## Dependencies
 

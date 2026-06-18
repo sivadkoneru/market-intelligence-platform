@@ -1,0 +1,268 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "elasticsearch",
+        "uid": "mip-elasticsearch-logs"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "alias": "log volume",
+          "bucketAggs": [
+            {
+              "field": "timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "auto"
+              },
+              "type": "date_histogram"
+            }
+          ],
+          "metrics": [
+            {
+              "id": "1",
+              "type": "count"
+            }
+          ],
+          "query": "*",
+          "refId": "A",
+          "timeField": "timestamp"
+        }
+      ],
+      "title": "Elasticsearch log volume",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "elasticsearch",
+        "uid": "mip-elasticsearch-logs"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "bucketAggs": [
+            {
+              "field": "service",
+              "id": "2",
+              "type": "terms",
+              "settings": {
+                "size": 10,
+                "order": "desc",
+                "orderBy": "_count"
+              }
+            }
+          ],
+          "metrics": [
+            {
+              "id": "1",
+              "type": "count"
+            }
+          ],
+          "query": "*",
+          "refId": "A",
+          "timeField": "timestamp"
+        }
+      ],
+      "title": "Elasticsearch logs by service",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "mip-druid-http"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "data": {
+            "query": "SELECT TIME_FLOOR(ticks.__time, 'PT5M') AS bucket, ticks.symbol, AVG(ticks.price) AS avg_price, AVG(indicators.rsi) AS avg_rsi FROM ticks LEFT JOIN indicators ON ticks.symbol = indicators.symbol AND ticks.__time = indicators.__time WHERE ticks.__time >= CURRENT_TIMESTAMP - INTERVAL '6' HOUR AND ticks.symbol = '${symbol}' GROUP BY 1, 2 ORDER BY 1, 2",
+            "resultFormat": "table"
+          },
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "method": "POST",
+          "parser": "backend",
+          "refId": "A",
+          "url": "http://druid:8888/druid/v2/sql"
+        }
+      ],
+      "title": "Druid market and indicator rows",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "mip-druid-http"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "data": {
+            "query": "SELECT TIME_FLOOR(__time, 'PT5M') AS bucket, symbol, AVG(volatility) AS avg_volatility FROM indicators WHERE __time >= CURRENT_TIMESTAMP - INTERVAL '6' HOUR AND symbol = '${symbol}' GROUP BY 1, 2 ORDER BY 1, 2",
+            "resultFormat": "time_series"
+          },
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "method": "POST",
+          "parser": "backend",
+          "refId": "A",
+          "url": "http://druid:8888/druid/v2/sql"
+        }
+      ],
+      "title": "Druid indicator volatility",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "observability",
+    "market-intelligence"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "BTCUSDT",
+          "value": "BTCUSDT"
+        },
+        "datasource": {
+          "type": "marcusolsson-json-datasource",
+          "uid": "mip-druid-http"
+        },
+        "definition": "SELECT DISTINCT symbol FROM ticks ORDER BY 1",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Symbol",
+        "multi": false,
+        "name": "symbol",
+        "options": [],
+        "query": "SELECT DISTINCT symbol FROM ticks ORDER BY 1",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Market Intelligence Observability",
+  "uid": "market-intelligence-observability",
+  "version": 1,
+  "weekStart": ""
+}

@@ -3,9 +3,12 @@ test_infra_compose.py — offline structural tests for T4 infra deliverables.
 
 Validates:
 - docker-compose.yml: required services present, each has a healthcheck,
-  image tags are pinned for postgres/redis/elasticsearch/grafana.
+  image tags are pinned for postgres/redis/elasticsearch/grafana, and Grafana
+  mounts the provisioning tree with the JSON datasource plugin enabled.
 - infra/servicebus-config.json: five topics present, correct subscriptions,
   duplicate detection enabled on market.raw and signals.
+- infra/grafana/provisioning: datasource and dashboard YAML/JSON are present
+  and the dashboard references both Elasticsearch and Druid datasources.
 
 No live Docker daemon or network access required.
 """
@@ -19,6 +22,17 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 SB_CONFIG_FILE = REPO_ROOT / "infra" / "servicebus-config.json"
+GRAFANA_ROOT = REPO_ROOT / "infra" / "grafana"
+GRAFANA_PROVISIONING_DIR = GRAFANA_ROOT / "provisioning"
+GRAFANA_DATASOURCES_FILE = (
+    GRAFANA_PROVISIONING_DIR / "datasources" / "datasources.yaml"
+)
+GRAFANA_DASHBOARDS_PROVIDER_FILE = (
+    GRAFANA_PROVISIONING_DIR / "dashboards" / "dashboards.yaml"
+)
+GRAFANA_DASHBOARD_FILE = (
+    GRAFANA_PROVISIONING_DIR / "dashboards-json" / "market-observability.json"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,6 +46,16 @@ def load_compose() -> dict:
 
 def load_sb_config() -> dict:
     with SB_CONFIG_FILE.open() as f:
+        return json.load(f)
+
+
+def load_yaml(path: Path) -> dict:
+    with path.open() as f:
+        return yaml.safe_load(f)
+
+
+def load_json(path: Path) -> dict:
+    with path.open() as f:
         return json.load(f)
 
 
@@ -148,6 +172,20 @@ class TestComposeServices:
             "Grafana must expose port 3000"
         )
 
+    def test_grafana_mounts_provisioning_tree(self, services: dict) -> None:
+        volumes = services["grafana"].get("volumes", [])
+        mount_paths = [str(v) for v in volumes]
+        assert any("/etc/grafana/provisioning" in p for p in mount_paths), (
+            "grafana must mount /etc/grafana/provisioning"
+        )
+
+    def test_grafana_installs_json_datasource_plugin(self, services: dict) -> None:
+        env = services["grafana"].get("environment", {})
+        plugins = env.get("GF_INSTALL_PLUGINS", "")
+        assert plugins == "marcusolsson-json-datasource 1.3.24", (
+            "grafana must install a pinned marcusolsson-json-datasource plugin"
+        )
+
     def test_servicebus_emulator_depends_on_mssql(self, services: dict) -> None:
         depends = services["servicebus-emulator"].get("depends_on", {})
         if isinstance(depends, list):
@@ -261,3 +299,148 @@ class TestServiceBusConfig:
             f"Expected exactly 5 topics, found {len(topics_by_name)}: "
             f"{list(topics_by_name.keys())}"
         )
+
+
+# ---------------------------------------------------------------------------
+# infra/grafana/provisioning — datasources and dashboards
+# ---------------------------------------------------------------------------
+
+
+class TestGrafanaProvisioning:
+    """Grafana provisioning files exist and wire both observability datasources."""
+
+    @pytest.fixture(scope="class")
+    def grafana_root(self) -> Path:
+        assert GRAFANA_ROOT.exists(), f"Grafana tree not found at {GRAFANA_ROOT}"
+        return GRAFANA_ROOT
+
+    @pytest.fixture(scope="class")
+    def grafana_provisioning(self, grafana_root: Path) -> Path:
+        assert GRAFANA_PROVISIONING_DIR.exists(), (
+            f"Grafana provisioning dir not found at {GRAFANA_PROVISIONING_DIR}"
+        )
+        return GRAFANA_PROVISIONING_DIR
+
+    @pytest.fixture(scope="class")
+    def datasources(self) -> dict:
+        assert GRAFANA_DATASOURCES_FILE.exists(), (
+            f"Grafana datasource file not found at {GRAFANA_DATASOURCES_FILE}"
+        )
+        return load_yaml(GRAFANA_DATASOURCES_FILE)
+
+    @pytest.fixture(scope="class")
+    def dashboards_provider(self) -> dict:
+        assert GRAFANA_DASHBOARDS_PROVIDER_FILE.exists(), (
+            f"Grafana dashboard provider not found at {GRAFANA_DASHBOARDS_PROVIDER_FILE}"
+        )
+        return load_yaml(GRAFANA_DASHBOARDS_PROVIDER_FILE)
+
+    @pytest.fixture(scope="class")
+    def dashboard(self) -> dict:
+        assert GRAFANA_DASHBOARD_FILE.exists(), (
+            f"Grafana dashboard not found at {GRAFANA_DASHBOARD_FILE}"
+        )
+        return load_json(GRAFANA_DASHBOARD_FILE)
+
+    def test_grafana_readme_exists(self, grafana_root: Path) -> None:
+        readme = grafana_root / "README.md"
+        assert readme.exists(), "infra/grafana/README.md missing"
+        assert "No financial advice" in readme.read_text(encoding="utf-8")
+
+    def test_provisioning_readme_exists(self, grafana_provisioning: Path) -> None:
+        readme = grafana_provisioning / "README.md"
+        assert readme.exists(), "infra/grafana/provisioning/README.md missing"
+        assert "No financial advice" in readme.read_text(encoding="utf-8")
+
+    def test_datasource_readme_exists(self) -> None:
+        readme = GRAFANA_PROVISIONING_DIR / "datasources" / "README.md"
+        assert readme.exists(), "infra/grafana/provisioning/datasources/README.md missing"
+        assert "No financial advice" in readme.read_text(encoding="utf-8")
+
+    def test_dashboards_readme_exists(self) -> None:
+        readme = GRAFANA_PROVISIONING_DIR / "dashboards" / "README.md"
+        assert readme.exists(), "infra/grafana/provisioning/dashboards/README.md missing"
+        assert "No financial advice" in readme.read_text(encoding="utf-8")
+
+    def test_dashboard_json_readme_exists(self) -> None:
+        readme = GRAFANA_PROVISIONING_DIR / "dashboards-json" / "README.md"
+        assert readme.exists(), (
+            "infra/grafana/provisioning/dashboards-json/README.md missing"
+        )
+        assert "No financial advice" in readme.read_text(encoding="utf-8")
+
+    def test_datasource_file_declares_elasticsearch_and_druid(self, datasources: dict) -> None:
+        entries = datasources.get("datasources", [])
+        assert len(entries) == 2, f"Expected 2 datasources, found {len(entries)}"
+        by_name = {entry["name"]: entry for entry in entries}
+        assert "Elasticsearch Logs" in by_name
+        assert "Druid HTTP" in by_name
+        assert by_name["Elasticsearch Logs"]["type"] == "elasticsearch"
+        assert by_name["Druid HTTP"]["type"] == "marcusolsson-json-datasource"
+        assert by_name["Elasticsearch Logs"]["url"] == "http://elasticsearch:9200"
+        assert by_name["Druid HTTP"]["url"] == "http://druid:8888/druid/v2/sql"
+        assert by_name["Elasticsearch Logs"]["jsonData"]["timeField"] == "timestamp"
+        assert by_name["Elasticsearch Logs"]["jsonData"]["logMessageField"] == "event"
+
+    def test_dashboard_provider_points_at_dashboard_json(self, dashboards_provider: dict) -> None:
+        providers = dashboards_provider.get("providers", [])
+        assert len(providers) == 1, f"Expected one dashboard provider, got {len(providers)}"
+        provider = providers[0]
+        assert provider["options"]["path"] == "/etc/grafana/provisioning/dashboards-json"
+        assert provider["type"] == "file"
+        assert provider["folder"] == "Market Intelligence"
+
+    def test_dashboard_uses_both_datasources(self, dashboard: dict) -> None:
+        panels = dashboard.get("panels", [])
+        assert len(panels) >= 4, "Expected at least four dashboard panels"
+
+        datasource_uids = {
+            panel.get("datasource", {}).get("uid")
+            for panel in panels
+            if isinstance(panel.get("datasource"), dict)
+        }
+        assert "mip-elasticsearch-logs" in datasource_uids, (
+            "Dashboard must reference the Elasticsearch logs datasource"
+        )
+        assert "mip-druid-http" in datasource_uids, (
+            "Dashboard must reference the Druid HTTP datasource"
+        )
+
+        panel_titles = {panel.get("title") for panel in panels}
+        assert "Elasticsearch log volume" in panel_titles
+        assert "Druid market and indicator rows" in panel_titles
+        assert "Druid indicator volatility" in panel_titles
+
+    def test_dashboard_panel_queries_cover_logs_and_druid(self, dashboard: dict) -> None:
+        panels = dashboard.get("panels", [])
+        elastic_queries = []
+        druid_queries = []
+        for panel in panels:
+            datasource = panel.get("datasource", {})
+            for target in panel.get("targets", []):
+                if datasource.get("uid") == "mip-elasticsearch-logs":
+                    elastic_queries.append(target)
+                if datasource.get("uid") == "mip-druid-http":
+                    druid_queries.append(target)
+
+        assert any(target.get("query") == "*" for target in elastic_queries), (
+            "Expected an Elasticsearch query over the log index"
+        )
+        assert all(
+            target.get("timeField") == "timestamp"
+            for target in elastic_queries
+            if target.get("timeField")
+        ), "Elasticsearch panels must use the structlog timestamp field"
+        assert any(
+            bucket.get("field") == "service"
+            for target in elastic_queries
+            for bucket in target.get("bucketAggs", [])
+        ), "Expected a service terms aggregation over the structlog service field"
+        assert any(
+            "SELECT TIME_FLOOR(" in target.get("data", {}).get("query", "")
+            for target in druid_queries
+        ), "Expected a Druid SQL query in the dashboard"
+        assert all(
+            "${symbol}" in target.get("data", {}).get("query", "")
+            for target in druid_queries
+        ), "Druid SQL panels must use the provisioned symbol variable"
