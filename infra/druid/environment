@@ -1,0 +1,41 @@
+# Druid common runtime environment variables
+# Used by druid service running micro-quickstart (single-node) profile.
+# Metadata store: PostgreSQL; Coordinator: ZooKeeper.
+
+# --- Metadata storage (PostgreSQL) ---
+druid_metadata_storage_type=postgresql
+druid_metadata_storage_connector_connectURI=jdbc:postgresql://postgres:5432/druid
+druid_metadata_storage_connector_user=${POSTGRES_USER:-druid}
+druid_metadata_storage_connector_password=${POSTGRES_PASSWORD:-druid}
+
+# --- ZooKeeper ---
+druid_zk_service_host=zookeeper
+
+# --- Deep storage (local for single-node) ---
+druid_storage_type=local
+druid_storage_storageDirectory=/opt/druid/var/druid/segments
+
+# --- Indexing logs (local) ---
+druid_indexer_logs_type=file
+druid_indexer_logs_directory=/opt/druid/var/druid/indexing-logs
+
+# --- Processing (memory-friendly for local dev) ---
+druid_processing_buffer_sizeBytes=67108864
+druid_processing_numThreads=1
+druid_processing_numMergeBuffers=1
+
+# --- Caching (disabled for dev simplicity) ---
+druid_broker_cache_useCache=false
+druid_broker_cache_populateCache=false
+
+# --- Security (no auth for local dev) ---
+druid_server_http_numThreads=10
+druid_startup_logging_logProperties=true
+
+# --- Extension loading ---
+druid_extensions_loadList=["druid-histogram","druid-datasketches","postgresql-metadata-storage","druid-kafka-indexing-service"]
+
+# --- Java memory (reduced for single-node local profile) ---
+DRUID_XMX=512m
+DRUID_XMS=256m
+DRUID_MAXDIRECTMEMORYSIZE=512m

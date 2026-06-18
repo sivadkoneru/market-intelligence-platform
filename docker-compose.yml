@@ -1,0 +1,247 @@
+# docker-compose.yml — Market Intelligence Platform: infrastructure services
+# T4 delivers infra only; Python app services (ingestion, stream, ai-analysis,
+# alerting, api) are added in T18 once their Dockerfiles exist.
+#
+# Druid profile: micro-quickstart single-node (apache/druid image with
+# DRUID_SINGLE_NODE_CONF=micro-quickstart).  Trade-off: simpler compose and
+# lower RAM (~2 GB vs ~6 GB for a full split topology), at the cost of no
+# independent scaling of historical/middlemanager/coordinator in production.
+# For local dev and portfolio demo this is acceptable; the AZURE_PRODUCTION.md
+# doc covers the production multi-node topology.
+
+x-druid-common: &druid-common
+  image: apache/druid:30.0.0
+  env_file:
+    - ./infra/druid/environment
+  depends_on:
+    postgres:
+      condition: service_healthy
+    zookeeper:
+      condition: service_healthy
+  networks:
+    - mip-net
+  restart: unless-stopped
+
+networks:
+  mip-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  druid-data:
+  es-data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # SQL Server — required backing store for the Azure Service Bus emulator
+  # ---------------------------------------------------------------------------
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mip-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd}"
+    ports:
+      - "1433:1433"
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa
+          -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -No 2>/dev/null
+          || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa
+          -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" 2>/dev/null
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Azure Service Bus Emulator
+  # Config JSON defines the namespace, 5 topics, and all subscriptions.
+  # Mount path inside container: /ServiceBus_Emulator/ConfigFiles/Config.json
+  # ---------------------------------------------------------------------------
+  servicebus-emulator:
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    container_name: mip-servicebus
+    environment:
+      ACCEPT_EULA: "Y"
+      SQL_SERVER: mssql
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd}"
+      EMULATOR_HTTP_PORT: "5300"
+    volumes:
+      - ./infra/servicebus-config.json:/ServiceBus_Emulator/ConfigFiles/Config.json:ro
+    ports:
+      - "5672:5672"   # AMQP
+      - "5300:5300"   # HTTP management / health
+    depends_on:
+      mssql:
+        condition: service_healthy
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5300/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 — app relational metadata + Druid metadata store
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: mip-postgres
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-mip}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-mip_local}"
+      POSTGRES_DB: "${POSTGRES_DB:-mip}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mip} -d ${POSTGRES_DB:-mip}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # ZooKeeper 3.8 — Druid coordination
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: mip-zookeeper
+    environment:
+      ZOO_MY_ID: "1"
+      ZOO_SERVERS: "server.1=zookeeper:2888:3888;2181"
+    ports:
+      - "2181:2181"
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Apache Druid 30.0.0 — single-node micro-quickstart profile
+  # (See trade-off comment at the top of this file)
+  # mem limit: 2 GB is sufficient for micro-quickstart; raise to 4 GB if OOM.
+  # ---------------------------------------------------------------------------
+  druid:
+    <<: *druid-common
+    container_name: mip-druid
+    environment:
+      DRUID_SINGLE_NODE_CONF: micro-quickstart
+      druid_metadata_storage_type: postgresql
+      druid_metadata_storage_connector_connectURI: "jdbc:postgresql://postgres:5432/${POSTGRES_DB:-mip}"
+      druid_metadata_storage_connector_user: "${POSTGRES_USER:-mip}"
+      druid_metadata_storage_connector_password: "${POSTGRES_PASSWORD:-mip_local}"
+      druid_zk_service_host: zookeeper
+      druid_storage_type: local
+      druid_storage_storageDirectory: /opt/druid/var/druid/segments
+      druid_indexer_logs_type: file
+      druid_indexer_logs_directory: /opt/druid/var/druid/indexing-logs
+      druid_processing_buffer_sizeBytes: "67108864"
+      druid_processing_numThreads: "1"
+      druid_processing_numMergeBuffers: "1"
+      druid_extensions_loadList: '["druid-histogram","druid-datasketches","postgresql-metadata-storage"]'
+      DRUID_XMX: 1g
+      DRUID_XMS: 512m
+      DRUID_MAXDIRECTMEMORYSIZE: 512m
+    volumes:
+      - druid-data:/opt/druid/var
+    ports:
+      - "8888:8888"   # Router / console
+    # mem_limit: 2g   # Uncomment if your Docker daemon enforces cgroup v2 memory limits
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/status/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — caching, latest-value snapshots, idempotency keys
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7
+    container_name: mip-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch 8.17.0 — structured log store + RAG vector search (kNN)
+  # Security disabled for local dev. mem_limit note: ES needs >= 1 GB heap.
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    container_name: mip-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - mip-net
+    restart: unless-stopped
+    # mem_limit: 1500m  # Uncomment to cap ES memory on resource-constrained hosts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Grafana 11.3.0 — dashboards over Elasticsearch / PostgreSQL / Druid
+  # Provisioning dir is mounted; datasources/dashboards added in T17.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: mip-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - mip-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
