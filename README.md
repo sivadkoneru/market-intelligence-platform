@@ -99,9 +99,6 @@ task smoke:ws      # Subscribe to the API websocket smoke stream
 task clean         # Remove .venv and cache directories
 ```
 
-`make setup`, `make test`, and the other top-level targets are thin wrappers around the
-same `task` commands for environments that expect `make`.
-
 ## Stack
 
 - **Language**: Python 3.12 (local dev and CI use Python 3.11 for the test environment)

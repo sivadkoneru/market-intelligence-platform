@@ -47,18 +47,6 @@ def test_taskfile_exists():
     assert "smoke:ws" in content
 
 
-def test_makefile_exists_as_thin_wrapper():
-    """Assert Makefile exists for compatibility wrappers around task."""
-    repo_root = Path(__file__).parent.parent
-    makefile_path = repo_root / "Makefile"
-    assert makefile_path.exists(), "Makefile does not exist"
-
-    content = makefile_path.read_text(encoding="utf-8")
-    assert "task test" in content
-    assert "task smoke:sb" in content
-    assert "task smoke:ws" in content
-
-
 def test_claude_md_exists_and_has_disclaimer():
     """Assert CLAUDE.md exists and contains no-financial-advice language."""
     repo_root = Path(__file__).parent.parent
@@ -67,6 +55,35 @@ def test_claude_md_exists_and_has_disclaimer():
 
     content = claude_md_path.read_text(encoding="utf-8").lower()
     assert "no financial advice" in content, "CLAUDE.md missing 'no financial advice' phrase"
+
+
+def test_agents_md_exists_for_codex_guidance():
+    """Assert AGENTS.md exists and points coding agents at the project guide."""
+    repo_root = Path(__file__).parent.parent
+    agents_md_path = repo_root / "AGENTS.md"
+    assert agents_md_path.exists(), "AGENTS.md does not exist"
+
+    content = agents_md_path.read_text(encoding="utf-8")
+    assert "CLAUDE.md" in content
+    assert "task test" in content
+    assert "no financial advice" in content.lower()
+
+
+def test_codex_helper_files_are_documented():
+    """Assert Codex helper files and README coverage exist."""
+    repo_root = Path(__file__).parent.parent
+    expected_files = [
+        ".codex/README.md",
+        ".codex/checklists/README.md",
+        ".codex/checklists/change.md",
+    ]
+    for file_name in expected_files:
+        path = repo_root / file_name
+        assert path.exists(), f"{file_name} does not exist"
+
+    checklist = (repo_root / ".codex/checklists/change.md").read_text(encoding="utf-8")
+    assert "AGENTS.md" in checklist
+    assert "docker compose config -q" in checklist
 
 
 def test_gitignore_exists():

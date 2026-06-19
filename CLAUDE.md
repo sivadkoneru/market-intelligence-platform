@@ -6,7 +6,7 @@ Codebase guide and binding conventions for engineers and future Claude sessions.
 
 ## Overview
 
-Multi-service Python platform that ingests live crypto market data and news events over WebSockets, streams them through Azure Service Bus, computes technical indicators (stream service) and RAG-driven LLM insights (AI analysis service), stores time-series in Apache Druid, and exposes data over REST + WebSocket APIs.
+Multi-service Python platform that ingests live crypto market data and news events over WebSockets/REST, streams them through Azure Service Bus, computes technical indicators (stream service) and RAG-driven LLM insights (AI analysis service), stores time-series in Apache Druid, emits rules-based alerts, and exposes data over REST + WebSocket APIs.
 
 **Portfolio project only — no financial advice, no real trades, no real capital at risk.**
 
@@ -17,10 +17,13 @@ Exchange WebSockets / News REST
     → ingestion service
         → Azure Service Bus (market.raw, news.raw)
             → stream service  → Druid (ticks + indicators) → Redis (latest snapshot)
-            → ai-analysis     → Elasticsearch kNN (RAG) → Redis (LLM cache)
+            → stream service  → signals topic
+            → ai-analysis     → Elasticsearch kNN (RAG) → Redis (LLM cache) → insights topic
             → alerting        → alerts topic
-    → api service  (REST + WebSocket, Druid / Redis / ES backed)
+    → api service  (REST + WebSocket, Druid / Redis / Elasticsearch / Service Bus backed)
 ```
+
+Current branch state: T0–T21 are complete on `feat/market-intel-platform`. Final-review fixes are included in commit `a81ed1e` and cover Azure Service Bus sectioned body decoding, New Relic runtime package pins, and the Druid Kafka-extension cleanup. Do not re-dispatch completed tasks.
 
 ---
 
@@ -45,7 +48,7 @@ Exchange WebSockets / News REST
 | ORM | SQLAlchemy 2.x async + asyncpg |
 | Data | pandas / numpy |
 | Tests | pytest + pytest-asyncio |
-| Observability | New Relic APM (opt-in, key required), Grafana dashboards |
+| Observability | structlog → Elasticsearch, New Relic APM (opt-in, key required), Grafana dashboards |
 | Containers | Docker + Docker Compose |
 
 **Banned** (not on resume): Prometheus, OpenTelemetry/Jaeger, Kafka/Redpanda, TimescaleDB, Qdrant.
@@ -64,9 +67,10 @@ services/
   alerting/         Rule evaluation, deduplication, dead-letter routing
   api/              FastAPI REST + WebSocket service
 infra/              docker-compose.yml, servicebus-config.json, druid/environment, grafana/
-docs/               ARCHITECTURE.md, SEQUENCE.md, API.md, adr/, AZURE_PRODUCTION.md, BENCHMARKS.md
-scripts/            sb_peek.py, ws_smoke.py, replay utilities
+docs/               ARCHITECTURE.md, SEQUENCE.md, API.md, ADRs/, AZURE_PRODUCTION.md, BENCHMARKS.md
+scripts/            bench.py, sb_peek.py, ws_smoke.py, replay utilities
 tests/              Repo-level smoke tests (structure, README disclaimer, tooling)
+azure-pipelines.yml Azure DevOps PR/push CI gate
 ```
 
 Each service and `libs/common` has its own `README.md`, `pyproject.toml`/`requirements.txt`, and `Dockerfile`.
@@ -85,12 +89,16 @@ task format     # black + ruff --fix
 task up         # docker compose up -d
 task down       # docker compose down -v
 task ps         # docker compose ps
+task smoke:sb   # peek local Service Bus emulator messages (strict by default)
+task smoke:ws   # subscribe to the API WebSocket smoke stream
 task clean      # remove .venv and all caches
 ```
 
 **`task test` is the quality gate.** It must pass with zero live infra, zero secrets, and zero network access — using in-memory fakes and MOCK_LLM only.
 
 The `.venv` is created with `python3.11` (the only locally available interpreter with compatible wheels). Docker images target `python:3.12-slim`. Do not change this split.
+
+`Taskfile.yml` is canonical. Any compatibility wrapper (for example a `Makefile`, if present) must only delegate to `task` targets and must not become a separate source of truth.
 
 ---
 
@@ -111,6 +119,10 @@ Every external dependency is accessed through a small interface (`typing.Protoco
 | LLM provider | `MOCK_LLM` (deterministic) | `AzureOpenAIClient` / `AnthropicClient` |
 
 Factory functions (e.g. `get_message_bus()`, `get_cache()`) select the fake automatically when the env var is absent or set to the default placeholder value. Tests use fakes exclusively — never reach the network.
+
+`ServiceBusBus` must decode Azure SDK received bodies as either raw bytes/strings or iterable AMQP body sections. If you touch receive, peek, or dead-letter receive paths, keep coverage for sectioned bodies in `libs/common/tests/test_bus.py`.
+
+The API WebSocket stream uses the dedicated `api-ws` Service Bus subscriptions so it does not drain the REST/API subscription. Keep infra topic config, docs, and tests aligned if subscriptions change.
 
 ### Common Schema
 
@@ -137,7 +149,9 @@ except ImportError:
     pass  # fall back to lightweight implementation
 ```
 
-The **tested path** is always the lightweight implementation inside `libs/common` and the service packages. `task test` must pass without any of these installed.
+The **tested path** is always the lightweight implementation inside `libs/common` and the service packages. `task test` must pass without any heavy framework SDKs installed.
+
+New Relic is special: `libs/common/logging.py` stays import-guarded for offline tests, but each service runtime image pins `newrelic==13.1.1` so APM can become active when credentials are present.
 
 ---
 
@@ -147,6 +161,34 @@ The **tested path** is always the lightweight implementation inside `libs/common
 - Every log event carries `correlation_id` and `trace_id` via `contextvars`.
 - Use `from libs.common import get_logger; log = get_logger(__name__)`.
 - Each service exposes `/health` and `/metrics`.
+- Request middleware echoes `X-Correlation-ID` and `X-Trace-ID` on success and error responses.
+- Elasticsearch log mirroring is best-effort; sink failures must never break request handling.
+
+---
+
+## Local Runtime Map
+
+Compose runs infra plus all five app services on `mip-net`.
+
+| Service | Host port | Container port |
+|---|---:|---:|
+| API | 8000 | 8005 |
+| Ingestion | 8001 | 8001 |
+| Stream | 8002 | 8002 |
+| AI analysis | 8003 | 8003 |
+| Alerting | 8004 | 8004 |
+| Grafana | 3000 | 3000 |
+| Druid router | 8888 | 8888 |
+| PostgreSQL | 5432 | 5432 |
+| Redis | 6379 | 6379 |
+| Elasticsearch | 9200 | 9200 |
+| Service Bus emulator | 5672 / 5300 | 5672 / 5300 |
+| SQL Server | 1433 | 1433 |
+| ZooKeeper | 2181 | 2181 |
+
+Local Druid uses the micro-quickstart single-node profile with PostgreSQL metadata storage. Keep `infra/druid/environment` Kafka-free; do not add the Druid Kafka indexing extension.
+
+`docker compose config -q` is part of the gate. A full `docker compose up -d --build` still requires a working local Docker daemon; the last branch run could not verify live startup because Docker was unavailable.
 
 ---
 
@@ -158,6 +200,8 @@ The **tested path** is always the lightweight implementation inside `libs/common
 4. **Resume-tech only** — see the banned list above.
 5. **Disclaimer** (no financial advice, no real trades) must appear in `README.md` and in the API root response.
 6. **`task test` must stay green** after every commit. Never commit broken tests.
+7. **`docker compose config -q` must stay green** after compose, env, or service runtime changes.
+8. **Do not reintroduce Kafka/Redpanda terms** except in explicit banned-tech assertions or historical notes.
 
 ---
 
