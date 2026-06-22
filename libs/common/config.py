@@ -8,7 +8,7 @@ Sensitive/optional fields (LLM keys, New Relic) default to None.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic_settings import BaseSettings
 
@@ -31,14 +31,15 @@ class Settings(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # LLM / AI providers (all optional — offline by default)
+    # LLM / AI provider (offline mock by default; one OpenAI-compatible client
+    # for live use — point OPENAI_BASE_URL at OpenAI, Azure, Anthropic, a local
+    # server, or any other OpenAI-compatible endpoint).
     # -------------------------------------------------------------------------
     mock_llm: bool = True
-    llm_provider: Literal["auto", "mock", "azure_openai", "anthropic"] = "auto"
-    embedding_provider: Literal["auto", "mock", "azure_openai"] = "auto"
-    azure_openai_api_key: Optional[str] = None
-    azure_openai_endpoint: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    openai_chat_model: str = "gpt-4o-mini"
+    openai_embedding_model: str = "text-embedding-3-small"
 
     # -------------------------------------------------------------------------
     # Observability

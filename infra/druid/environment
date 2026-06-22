@@ -1,5 +1,7 @@
-# Druid common runtime environment variables
-# Used by druid service running micro-quickstart (single-node) profile.
+# Druid common runtime environment variables.
+# Shared (via env_file) by every Druid container — coordinator, broker,
+# historical, middleManager, router — which the apache/druid image runs one
+# service per container. Profile: micro-quickstart (single-node) configs.
 # Metadata store: PostgreSQL; Coordinator: ZooKeeper.
 
 # --- Metadata storage (PostgreSQL) ---
@@ -39,3 +41,4 @@ druid_extensions_loadList=["druid-histogram","druid-datasketches","postgresql-me
 DRUID_XMX=512m
 DRUID_XMS=256m
 DRUID_MAXDIRECTMEMORYSIZE=512m
+DRUID_SINGLE_NODE_CONF=micro-quickstart

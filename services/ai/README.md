@@ -86,6 +86,40 @@ await bus.receive("signals", "ai", max_messages=0)
 await service.poll_once()
 ```
 
+## LLM / Embedding Provider
+
+There is one live provider — an **OpenAI-compatible** client (`OpenAIProvider`) — plus the
+offline `MockLLMProvider`. Resolution lives in `services.ai.llm.factory`, and the SDK import
+is lazy so the tested path stays offline.
+
+| Mode | Class | Trigger |
+|---|---|---|
+| Offline (default) | `MockLLMProvider` | `MOCK_LLM=1` |
+| Live | `OpenAIProvider` | `MOCK_LLM=0` **and** `OPENAI_API_KEY` set |
+
+`MOCK_LLM=0` without `OPENAI_API_KEY` raises a clear configuration error.
+
+The OpenAI Chat Completions + Embeddings shape is supported by every major provider, so a
+single client reaches all of them via `OPENAI_BASE_URL`:
+
+| Provider | `OPENAI_BASE_URL` |
+|---|---|
+| OpenAI | `https://api.openai.com/v1` |
+| Azure OpenAI | `https://<resource>.openai.azure.com/openai/v1` |
+| Anthropic | `https://api.anthropic.com/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Local (vLLM, llama.cpp) | `http://localhost:8001/v1` |
+
+To go live (example: OpenAI):
+
+```bash
+MOCK_LLM=0
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+```
+
 ## Notes
 
 - The AutoGen path is import-guarded. If `autogen` is not installed, the service uses a

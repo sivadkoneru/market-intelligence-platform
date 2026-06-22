@@ -19,6 +19,7 @@ REQUIRED_DOCS = [
     ADRS_ROOT / "0003-shared-schema-common-clients.md",
     ADRS_ROOT / "0004-mock-first-llm-rag-guardrails.md",
     ADRS_ROOT / "0005-observability-grafana.md",
+    ADRS_ROOT / "0006-openai-compatible-llm-provider.md",
 ]
 FORBIDDEN_TECH_TERMS = ("Prometheus", "OpenTelemetry", "Kafka", "Timescale", "Qdrant")
 

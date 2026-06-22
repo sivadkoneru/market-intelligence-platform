@@ -21,9 +21,9 @@ The package is intentionally small so T11/T12 can build RAG orchestration on top
 | File | Responsibility |
 |---|---|
 | `models.py` | request / response dataclasses and context documents |
-| `providers.py` | `MOCK_LLM`, Azure OpenAI, and Claude providers |
+| `providers.py` | `MockLLMProvider` and one OpenAI-compatible `OpenAIProvider` |
 | `guardrails.py` | citation, overlap, confidence, refusal, and empty-output checks |
-| `factory.py` | provider-selection helpers |
+| `factory.py` | provider-selection helpers (mock when offline, else OpenAI-compatible) |
 
 ## Usage
 
@@ -88,23 +88,22 @@ asyncio.run(main())
 
 - tuple of float vectors
 - provider name
-- model/deployment name
+- model name
 - vector dimensionality
 
 ## Dependencies
 
 - No live SDK is required for offline tests.
-- `openai` is optional and imported only when `AzureOpenAIProvider` needs to build a real
-  client.
-- `anthropic` is optional and imported only when `AnthropicProvider` needs to build a real
-  client.
+- `openai` is optional and imported lazily only when `OpenAIProvider` builds a real client.
+  The same client reaches any OpenAI-compatible endpoint (OpenAI, Azure OpenAI, Anthropic,
+  OpenRouter, local servers) via `OPENAI_BASE_URL`.
 
 Heavy/optional SDKs stay import-guarded so `task test` runs with the lightweight dependency set.
 
 ## Offline Behavior
 
 - `Settings.mock_llm` defaults to `True`, so factories resolve to `MockLLMProvider` unless the
-  caller opts into a real provider.
+  caller sets `MOCK_LLM=0` and provides `OPENAI_API_KEY`.
 - `MockLLMProvider` returns deterministic output for the same prompt/context and deterministic
   normalized embeddings for the same text.
 - Guardrails still run in mock mode, which keeps tests deterministic for grounded and ungrounded

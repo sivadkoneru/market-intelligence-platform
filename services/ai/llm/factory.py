@@ -1,4 +1,9 @@
-"""Factories that select the right LLM and embedding providers for the current mode."""
+"""Factories that select the LLM and embedding providers for the current mode.
+
+A single OpenAI-compatible provider covers every live backend (OpenAI, Azure OpenAI,
+Anthropic, OpenRouter, local servers) via ``OPENAI_BASE_URL``. The deterministic
+``MockLLMProvider`` is used whenever ``MOCK_LLM`` is set, keeping the tested path offline.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,10 @@ from typing import Any
 
 from libs.common.config import Settings, get_settings
 from services.ai.llm.providers import (
-    AnthropicProvider,
-    AzureOpenAIProvider,
     EmbeddingProvider,
     LLMProvider,
     MockLLMProvider,
+    OpenAIProvider,
 )
 
 
@@ -27,134 +31,61 @@ def _resolved_settings(settings: Settings | None) -> Settings:
     return settings or get_settings()
 
 
-def _has_azure_credentials(settings: Settings) -> bool:
-    return bool(settings.azure_openai_api_key and settings.azure_openai_endpoint)
+def _build_openai(settings: Settings, client: Any | None) -> OpenAIProvider:
+    return OpenAIProvider(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        chat_model=settings.openai_chat_model,
+        embedding_model=settings.openai_embedding_model,
+        client=client,
+    )
 
 
-def _has_anthropic_credentials(settings: Settings) -> bool:
-    return bool(settings.anthropic_api_key)
-
-
-def _mock_allowed(settings: Settings, explicit_provider: str) -> bool:
-    return settings.mock_llm and explicit_provider in {"auto", "mock"}
-
-
-def _explicit_missing_credentials(provider: str) -> RuntimeError:
-    if provider == "azure_openai":
-        return RuntimeError(
-            "LLM provider 'azure_openai' requires AZURE_OPENAI_API_KEY and "
-            "AZURE_OPENAI_ENDPOINT."
-        )
-    if provider == "anthropic":
-        return RuntimeError(
-            "LLM provider 'anthropic' requires ANTHROPIC_API_KEY."
-        )
-    return RuntimeError(f"Unknown LLM provider selection: {provider}")
-
-
-def _explicit_missing_embedding_credentials(provider: str) -> RuntimeError:
-    if provider == "azure_openai":
-        return RuntimeError(
-            "Embedding provider 'azure_openai' requires AZURE_OPENAI_API_KEY and "
-            "AZURE_OPENAI_ENDPOINT."
-        )
-    return RuntimeError(f"Unknown embedding provider selection: {provider}")
+def _missing_api_key() -> RuntimeError:
+    return RuntimeError(
+        "No LLM provider configured. Set OPENAI_API_KEY (any OpenAI-compatible endpoint "
+        "via OPENAI_BASE_URL), or set MOCK_LLM=1 for offline mode."
+    )
 
 
 def get_llm_provider(
     settings: Settings | None = None,
     *,
-    azure_client: Any | None = None,
-    anthropic_client: Any | None = None,
+    openai_client: Any | None = None,
 ) -> LLMProvider:
-    """Return the configured generation provider, defaulting to deterministic mock mode."""
+    """Return the generation provider: mock when offline, else OpenAI-compatible."""
 
     resolved = _resolved_settings(settings)
-    selection = resolved.llm_provider
-
-    if selection == "mock" or _mock_allowed(resolved, selection):
+    if resolved.mock_llm:
         return MockLLMProvider()
-
-    if selection == "azure_openai":
-        if not _has_azure_credentials(resolved):
-            raise _explicit_missing_credentials(selection)
-        return AzureOpenAIProvider(
-            api_key=resolved.azure_openai_api_key,
-            endpoint=resolved.azure_openai_endpoint,
-            client=azure_client,
-        )
-
-    if selection == "anthropic":
-        if not _has_anthropic_credentials(resolved):
-            raise _explicit_missing_credentials(selection)
-        return AnthropicProvider(
-            api_key=resolved.anthropic_api_key,
-            client=anthropic_client,
-        )
-
-    if _has_azure_credentials(resolved):
-        return AzureOpenAIProvider(
-            api_key=resolved.azure_openai_api_key,
-            endpoint=resolved.azure_openai_endpoint,
-            client=azure_client,
-        )
-    if _has_anthropic_credentials(resolved):
-        return AnthropicProvider(
-            api_key=resolved.anthropic_api_key,
-            client=anthropic_client,
-        )
-    return MockLLMProvider()
+    if resolved.openai_api_key:
+        return _build_openai(resolved, openai_client)
+    raise _missing_api_key()
 
 
 def get_embedding_provider(
     settings: Settings | None = None,
     *,
-    azure_client: Any | None = None,
+    openai_client: Any | None = None,
 ) -> EmbeddingProvider:
-    """Return the configured embedding provider, defaulting to deterministic mock mode."""
+    """Return the embedding provider: mock when offline, else OpenAI-compatible."""
 
     resolved = _resolved_settings(settings)
-    selection = resolved.embedding_provider
-
-    if selection == "mock" or _mock_allowed(resolved, selection):
-        return MockLLMProvider()
-
-    if selection == "azure_openai":
-        if not _has_azure_credentials(resolved):
-            raise _explicit_missing_embedding_credentials(selection)
-        return AzureOpenAIProvider(
-            api_key=resolved.azure_openai_api_key,
-            endpoint=resolved.azure_openai_endpoint,
-            client=azure_client,
-        )
-
-    if _has_azure_credentials(resolved):
-        return AzureOpenAIProvider(
-            api_key=resolved.azure_openai_api_key,
-            endpoint=resolved.azure_openai_endpoint,
-            client=azure_client,
-        )
     if resolved.mock_llm:
         return MockLLMProvider()
-    raise RuntimeError(
-        "No real embedding provider is configured. Configure Azure OpenAI embeddings "
-        "(AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT) or use MOCK_LLM."
-    )
+    if resolved.openai_api_key:
+        return _build_openai(resolved, openai_client)
+    raise _missing_api_key()
 
 
 def get_provider_bundle(
     settings: Settings | None = None,
     *,
-    azure_client: Any | None = None,
-    anthropic_client: Any | None = None,
+    openai_client: Any | None = None,
 ) -> ProviderBundle:
     """Return a matched generator/embedder pair for the current runtime mode."""
 
     return ProviderBundle(
-        generator=get_llm_provider(
-            settings,
-            azure_client=azure_client,
-            anthropic_client=anthropic_client,
-        ),
-        embedder=get_embedding_provider(settings, azure_client=azure_client),
+        generator=get_llm_provider(settings, openai_client=openai_client),
+        embedder=get_embedding_provider(settings, openai_client=openai_client),
     )

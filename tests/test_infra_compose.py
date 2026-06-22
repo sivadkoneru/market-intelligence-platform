@@ -58,12 +58,24 @@ def load_json(path: Path) -> dict:
 # docker-compose.yml — required infra services
 # ---------------------------------------------------------------------------
 
+# Apache Druid runs one service per container — the official apache/druid image
+# entrypoint launches a single named Druid service, so the single-node profile
+# is split into these five. Only the router publishes the 8888 console/SQL API.
+DRUID_IMAGE = "apache/druid:37.0.0"
+DRUID_SERVICES = [
+    "druid-coordinator",
+    "druid-broker",
+    "druid-historical",
+    "druid-middlemanager",
+    "druid-router",
+]
+
 REQUIRED_SERVICES = [
     "mssql",
     "servicebus-emulator",
     "postgres",
     "zookeeper",
-    "druid",
+    *DRUID_SERVICES,
     "redis",
     "elasticsearch",
     "grafana",
@@ -81,11 +93,17 @@ PINNED_TAG_SERVICES = {
     "elasticsearch": "docker.elastic.co/elasticsearch/elasticsearch:8.17.0",
     "grafana": "grafana/grafana:11.3.0",
     "zookeeper": "zookeeper:3.8",
-    "druid": "apache/druid:30.0.0",
+    **{svc: DRUID_IMAGE for svc in DRUID_SERVICES},
 }
 
 # SB emulator and mssql are allowed to use :latest per brief
 LATEST_ALLOWED = {"mssql", "servicebus-emulator"}
+
+# The Service Bus emulator runs a distroless image (no shell, curl, or other
+# probe binary), so no in-container healthcheck command can exec. Dependents
+# gate on `condition: service_started` instead, so this service must NOT define
+# a healthcheck.
+NO_HEALTHCHECK_SERVICES = {"servicebus-emulator"}
 
 APP_BACKEND_ENV = {
     "SERVICE_BUS_CONNECTION_STRING": (
@@ -95,7 +113,7 @@ APP_BACKEND_ENV = {
         "UseDevelopmentEmulator=true;"
     ),
     "REDIS_URL": "redis://redis:6379/0",
-    "DRUID_URL": "http://druid:8888",
+    "DRUID_URL": "http://druid-router:8888",
     "ELASTICSEARCH_URL": "http://elasticsearch:9200",
 }
 
@@ -110,7 +128,7 @@ APP_SERVICES = {
         "dockerfile": "services/stream/Dockerfile",
         "container_port": "8002",
         "host_port": "8002",
-        "depends_on": {"servicebus-emulator", "redis", "druid", "elasticsearch"},
+        "depends_on": {"servicebus-emulator", "redis", "druid-router", "elasticsearch"},
     },
     "ai-analysis": {
         "dockerfile": "services/ai/Dockerfile",
@@ -128,7 +146,7 @@ APP_SERVICES = {
         "dockerfile": "services/api/Dockerfile",
         "container_port": "8005",
         "host_port": "8000",
-        "depends_on": {"servicebus-emulator", "redis", "druid", "elasticsearch"},
+        "depends_on": {"servicebus-emulator", "redis", "druid-router", "elasticsearch"},
     },
 }
 
@@ -160,6 +178,12 @@ class TestComposeServices:
     @pytest.mark.parametrize("svc", REQUIRED_SERVICES)
     def test_service_has_healthcheck(self, services: dict, svc: str) -> None:
         svc_def = services.get(svc, {})
+        if svc in NO_HEALTHCHECK_SERVICES:
+            assert "healthcheck" not in svc_def, (
+                f"Service '{svc}' runs a distroless image and cannot exec a healthcheck; "
+                "it must not define one (dependents use condition: service_started)"
+            )
+            return
         assert "healthcheck" in svc_def, f"Service '{svc}' has no healthcheck defined"
         hc = svc_def["healthcheck"]
         assert "test" in hc, f"Service '{svc}' healthcheck has no 'test' key"
@@ -197,12 +221,57 @@ class TestComposeServices:
         env = services["mssql"].get("environment", {})
         assert env.get("ACCEPT_EULA") == "Y", "mssql must set ACCEPT_EULA=Y"
 
-    def test_druid_exposes_router_port_8888(self, services: dict) -> None:
-        ports = services["druid"].get("ports", [])
-        port_strings = [str(p) for p in ports]
+    def test_only_router_exposes_port_8888(self, services: dict) -> None:
+        """The router is the single published Druid endpoint on 8888."""
+        router_ports = [str(p) for p in services["druid-router"].get("ports", [])]
         assert any(
-            "8888" in p for p in port_strings
-        ), "Druid must expose port 8888 (router/console)"
+            "8888" in p for p in router_ports
+        ), "druid-router must expose port 8888 (router/console + SQL API)"
+        # The other Druid nodes are internal-only; they must not publish ports.
+        for svc in DRUID_SERVICES:
+            if svc == "druid-router":
+                continue
+            assert not services[svc].get("ports"), (
+                f"{svc} must not publish host ports; only druid-router is exposed"
+            )
+
+    @pytest.mark.parametrize(
+        "svc,command",
+        [
+            ("druid-coordinator", "coordinator"),
+            ("druid-broker", "broker"),
+            ("druid-historical", "historical"),
+            ("druid-middlemanager", "middleManager"),
+            ("druid-router", "router"),
+        ],
+    )
+    def test_druid_service_runs_single_named_process(
+        self, services: dict, svc: str, command: str
+    ) -> None:
+        """Each Druid container launches exactly one named service via `command`."""
+        cmd = services[svc].get("command")
+        cmd_list = cmd if isinstance(cmd, list) else [cmd]
+        assert cmd_list == [command], (
+            f"{svc} must run `{command}` (apache/druid runs one service per container)"
+        )
+
+    def test_druid_shares_local_deep_storage(self, services: dict) -> None:
+        """With druid.storage.type=local the segment + indexing-log dirs are shared.
+
+        The middleManager writes segments to deep storage and the historical reads
+        them back, so both must mount the same druid-segments volume; the overlord
+        (in the coordinator) and middleManager share druid-indexer-logs.
+        """
+
+        def mounts(svc: str) -> list[str]:
+            return [str(v) for v in services[svc].get("volumes", [])]
+
+        seg = "druid-segments:/opt/druid/var/druid/segments"
+        logs = "druid-indexer-logs:/opt/druid/var/druid/indexing-logs"
+        assert seg in mounts("druid-historical")
+        assert seg in mounts("druid-middlemanager")
+        assert logs in mounts("druid-coordinator")
+        assert logs in mounts("druid-middlemanager")
 
     def test_grafana_exposes_port_3000(self, services: dict) -> None:
         ports = services["grafana"].get("ports", [])
@@ -282,22 +351,22 @@ class TestComposeServices:
         ports = [str(port) for port in services["api"].get("ports", [])]
         assert "8000:8005" in ports
 
-    def test_druid_metadata_store_uses_dedicated_env_vars(self, services: dict) -> None:
-        env = services["druid"].get("environment", {})
-        assert env["druid_metadata_storage_connector_connectURI"] == (
+    def test_druid_metadata_store_uses_dedicated_env_vars(self) -> None:
+        # The Druid containers share these settings via env_file (the anchor),
+        # so the PostgreSQL metadata config lives only in infra/druid/environment.
+        env_text = DRUID_ENV_FILE.read_text(encoding="utf-8")
+        assert "druid_metadata_storage_type=postgresql" in env_text
+        assert (
+            "druid_metadata_storage_connector_connectURI="
             "jdbc:postgresql://postgres:5432/${DRUID_POSTGRES_DB:-mip}"
-        )
-        assert env["druid_metadata_storage_connector_user"] == "${DRUID_POSTGRES_USER:-mip}"
-        assert env["druid_metadata_storage_connector_password"] == (
-            "${DRUID_POSTGRES_PASSWORD:-mip_local}"
-        )
+        ) in env_text
+        assert "druid_metadata_storage_connector_user=${DRUID_POSTGRES_USER:-mip}" in env_text
+        assert (
+            "druid_metadata_storage_connector_password=${DRUID_POSTGRES_PASSWORD:-mip_local}"
+        ) in env_text
 
-    def test_druid_extension_config_is_kafka_free(self, services: dict) -> None:
-        env = services["druid"].get("environment", {})
-        compose_extensions = env["druid_extensions_loadList"]
+    def test_druid_extension_config_is_kafka_free(self) -> None:
         file_extensions = DRUID_ENV_FILE.read_text(encoding="utf-8")
-
-        assert "druid-kafka-indexing-service" not in compose_extensions
         assert "druid-kafka-indexing-service" not in file_extensions
         assert "postgresql-metadata-storage" in file_extensions
 
@@ -469,7 +538,7 @@ class TestGrafanaProvisioning:
         assert by_name["Elasticsearch Logs"]["type"] == "elasticsearch"
         assert by_name["Druid HTTP"]["type"] == "marcusolsson-json-datasource"
         assert by_name["Elasticsearch Logs"]["url"] == "http://elasticsearch:9200"
-        assert by_name["Druid HTTP"]["url"] == "http://druid:8888/druid/v2/sql"
+        assert by_name["Druid HTTP"]["url"] == "http://druid-router:8888/druid/v2/sql"
         assert by_name["Elasticsearch Logs"]["jsonData"]["timeField"] == "timestamp"
         assert by_name["Elasticsearch Logs"]["jsonData"]["logMessageField"] == "event"
 

@@ -244,6 +244,19 @@ class DruidClient:
                 json={"query": sql},
                 headers={"Content-Type": "application/json"},
             )
+            # Druid creates a datasource lazily on first ingest. Querying one
+            # that does not exist yet returns 400 "Object '<table>' not found".
+            # Treat that as an empty result — mirroring InMemoryTimeSeriesStore
+            # on an unknown table — instead of surfacing it as a 500. Other 400s
+            # (genuine SQL errors, e.g. a missing column) still raise.
+            if resp.status_code == 400:
+                try:
+                    message = str(resp.json().get("errorMessage", ""))
+                except Exception:
+                    message = resp.text
+                lowered = message.lower()
+                if "object '" in lowered and "not found" in lowered:
+                    return []
             resp.raise_for_status()
             return resp.json()
 

@@ -40,7 +40,7 @@ Current branch state: T0–T21 are complete on `feat/market-intel-platform`. Fin
 | Relational | PostgreSQL 16 (app metadata + Druid metadata store) |
 | Cache | Redis 7 |
 | Vector / log store | Elasticsearch 8 kNN (`dense_vector`) |
-| LLM providers | Azure OpenAI, Claude (Anthropic), MOCK_LLM (default, no key required) |
+| LLM provider | One OpenAI-compatible client (`OPENAI_BASE_URL` → OpenAI / Azure OpenAI / Anthropic / local); MOCK_LLM default, no key required. See ADR 0006 |
 | Heavy frameworks | LangChain, LlamaIndex, AutoGen (import-guarded optionals — see below) |
 | Schema / config | Pydantic v2 + pydantic-settings |
 | Logging | structlog (JSON only) |
@@ -116,7 +116,7 @@ Every external dependency is accessed through a small interface (`typing.Protoco
 | `Cache` | `InMemoryCache` | `RedisCache` |
 | `TimeSeriesStore` | `InMemoryTimeSeriesStore` | `DruidClient` |
 | `SearchStore` | `InMemorySearchStore` | `ElasticsearchStore` |
-| LLM provider | `MOCK_LLM` (deterministic) | `AzureOpenAIClient` / `AnthropicClient` |
+| LLM provider | `MOCK_LLM` (deterministic) | `OpenAIProvider` (OpenAI-compatible; any `OPENAI_BASE_URL`) |
 
 Factory functions (e.g. `get_message_bus()`, `get_cache()`) select the fake automatically when the env var is absent or set to the default placeholder value. Tests use fakes exclusively — never reach the network.
 
@@ -186,7 +186,7 @@ Compose runs infra plus all five app services on `mip-net`.
 | SQL Server | 1433 | 1433 |
 | ZooKeeper | 2181 | 2181 |
 
-Local Druid uses the micro-quickstart single-node profile with PostgreSQL metadata storage. Keep `infra/druid/environment` Kafka-free; do not add the Druid Kafka indexing extension.
+Local Druid uses the micro-quickstart profile with PostgreSQL metadata storage, run as **one container per service** — `druid-coordinator` (overlord embedded via `asOverlord`), `druid-broker`, `druid-historical`, `druid-middlemanager`, `druid-router` — because the `apache/druid` image entrypoint launches a single named service per container (there is no all-in-one mode). All five share the image and `infra/druid/environment` via the `x-druid-common` anchor; only `druid-router` publishes 8888, so app `DRUID_URL` points at `http://druid-router:8888`. Because deep storage is `local`, the segment and indexing-log directories are shared across nodes through the `druid-segments` / `druid-indexer-logs` named volumes. Healthchecks use `wget` (the image has no `curl`). Keep `infra/druid/environment` Kafka-free; do not add the Druid Kafka indexing extension.
 
 `docker compose config -q` is part of the gate. A full `docker compose up -d --build` still requires a working local Docker daemon; the last branch run could not verify live startup because Docker was unavailable.
 

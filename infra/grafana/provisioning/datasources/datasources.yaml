@@ -19,7 +19,7 @@ datasources:
     uid: mip-druid-http
     type: marcusolsson-json-datasource
     access: proxy
-    url: http://druid:8888/druid/v2/sql
+    url: http://druid-router:8888/druid/v2/sql
     isDefault: false
     editable: false
     jsonData:

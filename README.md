@@ -108,6 +108,6 @@ task clean         # Remove .venv and cache directories
 - **Time-series**: Apache Druid
 - **Vector search**: Elasticsearch kNN
 - **Databases**: PostgreSQL, Redis
-- **LLM**: Azure OpenAI, Claude, or MOCK_LLM (default)
+- **LLM**: one OpenAI-compatible client (point `OPENAI_BASE_URL` at OpenAI, Azure OpenAI, Anthropic, or a local server), or MOCK_LLM (default)
 - **Linting/Formatting**: ruff, black
 - **Testing**: pytest, pytest-asyncio

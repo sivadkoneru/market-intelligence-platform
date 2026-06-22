@@ -1,13 +1,23 @@
 # docker-compose.yml — Market Intelligence Platform: infra + application services
-# Druid profile: micro-quickstart single-node (apache/druid image with
-# DRUID_SINGLE_NODE_CONF=micro-quickstart).  Trade-off: simpler compose and
-# lower RAM (~2 GB vs ~6 GB for a full split topology), at the cost of no
-# independent scaling of historical/middlemanager/coordinator in production.
-# For local dev and portfolio demo this is acceptable; the AZURE_PRODUCTION.md
-# doc covers the production multi-node topology.
+# Druid: the official apache/druid image entrypoint (/druid.sh) runs exactly ONE
+# Druid service per container, named by `command:` — there is no all-in-one mode
+# (the tarball bin/start-*-quickstart scripts need perl/python that the image
+# does not ship). So Druid runs as the standard split: coordinator (with the
+# overlord embedded via asOverlord), broker, historical, middleManager, router.
+# All share PostgreSQL metadata + ZooKeeper (see x-druid-common and
+# infra/druid/environment); DRUID_SINGLE_NODE_CONF=micro-quickstart keeps each
+# node's heap small for local dev. Only the router publishes the 8888 console.
+# AZURE_PRODUCTION.md covers the production multi-node sizing.
 
 x-druid-common: &druid-common
-  image: apache/druid:30.0.0
+  platform: linux/amd64
+  image: apache/druid:37.0.0
+  # The image runs as the non-root `druid` user (uid 1000), but Docker creates
+  # the named-volume mountpoints below (and their parent /opt/druid/var/druid)
+  # as root, so the entrypoint cannot create var/druid/{task,segment-cache,…}.
+  # Running these dev containers as root sidesteps the volume-ownership friction;
+  # production uses managed Druid (see AZURE_PRODUCTION.md), not this compose.
+  user: "0:0"
   env_file:
     - ./infra/druid/environment
   depends_on:
@@ -18,10 +28,20 @@ x-druid-common: &druid-common
   networks:
     - mip-net
   restart: unless-stopped
+  mem_limit: 2g                  # ~512m heap + 512m direct per node; raise if OOM
+  # The router fails to start with only 1 CPU — it sizes internal thread pools from
+  # Runtime.availableProcessors(), which yields 0 workers at 1 CPU and aborts before
+  # logging (exit 1). Keep this >= 2.
+  cpus: 2
 
 x-app-common: &app-common
   networks:
     - mip-net
+  # Lets containers reach a model server running on the host (e.g. Ollama,
+  # vLLM, LM Studio) via http://host.docker.internal:<port>. Automatic on
+  # Docker Desktop; this mapping also makes it resolve on Linux.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   restart: unless-stopped
 
 networks:
@@ -30,7 +50,12 @@ networks:
 
 volumes:
   postgres-data:
-  druid-data:
+  # Druid local deep storage + indexing logs are shared across the data/ingest/
+  # query nodes (see the Druid services below). With druid.storage.type=local the
+  # historical must read the segments the middleManager wrote, so these dirs
+  # cannot be per-container.
+  druid-segments:
+  druid-indexer-logs:
   es-data:
 
 services:
@@ -38,7 +63,11 @@ services:
   # SQL Server — required backing store for the Azure Service Bus emulator
   # ---------------------------------------------------------------------------
   mssql:
-    image: mcr.microsoft.com/mssql/server:2022-latest
+    # Azure SQL Edge is the Service Bus emulator's documented backing store and
+    # ships a native arm64 image, so it runs without QEMU on Apple Silicon. The
+    # full mcr.microsoft.com/mssql/server image is amd64-only and segfaults under
+    # emulation on arm64 Macs. SQL Edge is multi-arch, so amd64/CI hosts work too.
+    image: mcr.microsoft.com/azure-sql-edge:latest
     container_name: mip-mssql
     environment:
       ACCEPT_EULA: "Y"
@@ -49,12 +78,10 @@ services:
       - mip-net
     restart: unless-stopped
     healthcheck:
-      test:
-        - CMD-SHELL
-        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa
-          -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -No 2>/dev/null
-          || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa
-          -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" 2>/dev/null
+      # SQL Edge does not ship sqlcmd/mssql-tools, so probe the TCP port via
+      # bash /dev/tcp. The Service Bus emulator retries its own SQL connection,
+      # so port-open readiness is sufficient to gate startup here.
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/1433' || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -84,12 +111,11 @@ services:
     networks:
       - mip-net
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5300/health || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
+    # No healthcheck: the emulator image is distroless (no shell, curl, or other
+    # probe binary), so any in-container healthcheck command fails to exec.
+    # Dependents use `condition: service_started`; the emulator opens AMQP 5672
+    # within a few seconds, and the app services retry the bus connection
+    # (tenacity + CircuitBreaker) until topics are ready.
 
   # ---------------------------------------------------------------------------
   # PostgreSQL 16 — app relational metadata + Druid metadata store
@@ -124,6 +150,9 @@ services:
     environment:
       ZOO_MY_ID: "1"
       ZOO_SERVERS: "server.1=zookeeper:2888:3888;2181"
+      # The image enables only `srvr` in the four-letter-word allowlist by
+      # default; the healthcheck below uses `ruok`, so it must be whitelisted.
+      ZOO_4LW_COMMANDS_WHITELIST: "srvr,ruok"
     ports:
       - "2181:2181"
     networks:
@@ -137,42 +166,76 @@ services:
       start_period: 15s
 
   # ---------------------------------------------------------------------------
-  # Apache Druid 30.0.0 — single-node micro-quickstart profile
-  # (See trade-off comment at the top of this file)
-  # mem limit: 2 GB is sufficient for micro-quickstart; raise to 4 GB if OOM.
+  # Apache Druid 37.0.0 — per-service single-node topology (see header comment).
+  # All five services share the apache/druid image + infra/druid/environment via
+  # the x-druid-common anchor; each sets only its own `command:`, port, volumes,
+  # and healthcheck. The image ships wget (not curl), so /status/health is probed
+  # with wget. coordinator runs the overlord in-process (asOverlord, set in the
+  # micro-quickstart config), so no separate overlord container is needed.
   # ---------------------------------------------------------------------------
-  druid:
+  druid-coordinator:
     <<: *druid-common
-    container_name: mip-druid
-    environment:
-      DRUID_SINGLE_NODE_CONF: micro-quickstart
-      druid_metadata_storage_type: postgresql
-      druid_metadata_storage_connector_connectURI: "jdbc:postgresql://postgres:5432/${DRUID_POSTGRES_DB:-mip}"
-      druid_metadata_storage_connector_user: "${DRUID_POSTGRES_USER:-mip}"
-      druid_metadata_storage_connector_password: "${DRUID_POSTGRES_PASSWORD:-mip_local}"
-      druid_zk_service_host: zookeeper
-      druid_storage_type: local
-      druid_storage_storageDirectory: /opt/druid/var/druid/segments
-      druid_indexer_logs_type: file
-      druid_indexer_logs_directory: /opt/druid/var/druid/indexing-logs
-      druid_processing_buffer_sizeBytes: "67108864"
-      druid_processing_numThreads: "1"
-      druid_processing_numMergeBuffers: "1"
-      druid_extensions_loadList: '["druid-histogram","druid-datasketches","postgresql-metadata-storage"]'
-      DRUID_XMX: 1g
-      DRUID_XMS: 512m
-      DRUID_MAXDIRECTMEMORYSIZE: 512m
+    container_name: mip-druid-coordinator
+    command: ["coordinator"]
     volumes:
-      - druid-data:/opt/druid/var
-    ports:
-      - "8888:8888"   # Router / console
-    # mem_limit: 2g   # Uncomment if your Docker daemon enforces cgroup v2 memory limits
+      - druid-indexer-logs:/opt/druid/var/druid/indexing-logs
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8888/status/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8081/status/health || exit 1"]
       interval: 20s
       timeout: 10s
-      retries: 15
-      start_period: 90s
+      retries: 20
+      start_period: 120s
+
+  druid-broker:
+    <<: *druid-common
+    container_name: mip-druid-broker
+    command: ["broker"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8082/status/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  druid-historical:
+    <<: *druid-common
+    container_name: mip-druid-historical
+    command: ["historical"]
+    volumes:
+      - druid-segments:/opt/druid/var/druid/segments
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8083/status/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  druid-middlemanager:
+    <<: *druid-common
+    container_name: mip-druid-middlemanager
+    command: ["middleManager"]
+    volumes:
+      - druid-segments:/opt/druid/var/druid/segments
+      - druid-indexer-logs:/opt/druid/var/druid/indexing-logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8091/status/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  druid-router:
+    <<: *druid-common
+    container_name: mip-druid-router
+    command: ["router"]
+    ports:
+      - "8888:8888"   # Router / console + SQL/HTTP API
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8888/status/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
 
   # ---------------------------------------------------------------------------
   # Redis 7 — caching, latest-value snapshots, idempotency keys
@@ -259,25 +322,24 @@ services:
       SERVICE_NAME: ingestion
       SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
       REDIS_URL: "redis://redis:6379/0"
-      DRUID_URL: "http://druid:8888"
+      DRUID_URL: "http://druid-router:8888"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
       POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
       MOCK_LLM: "${MOCK_LLM:-1}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
-      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
       NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
       NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
       NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
-      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
-      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
     ports:
       - "8001:8001"
     depends_on:
       servicebus-emulator:
-        condition: service_healthy
+        condition: service_started
       elasticsearch:
         condition: service_healthy
     healthcheck:
@@ -297,28 +359,27 @@ services:
       SERVICE_NAME: stream
       SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
       REDIS_URL: "redis://redis:6379/0"
-      DRUID_URL: "http://druid:8888"
+      DRUID_URL: "http://druid-router:8888"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
       POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
       MOCK_LLM: "${MOCK_LLM:-1}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
-      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
       NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
       NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
       NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
-      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
-      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
     ports:
       - "8002:8002"
     depends_on:
       servicebus-emulator:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
-      druid:
+      druid-router:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -339,25 +400,24 @@ services:
       SERVICE_NAME: ai-analysis
       SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
       REDIS_URL: "redis://redis:6379/0"
-      DRUID_URL: "http://druid:8888"
+      DRUID_URL: "http://druid-router:8888"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
       POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
       MOCK_LLM: "${MOCK_LLM:-1}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
-      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
       NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
       NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
       NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
-      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
-      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
     ports:
       - "8003:8003"
     depends_on:
       servicebus-emulator:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
       elasticsearch:
@@ -379,25 +439,24 @@ services:
       SERVICE_NAME: alerting
       SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
       REDIS_URL: "redis://redis:6379/0"
-      DRUID_URL: "http://druid:8888"
+      DRUID_URL: "http://druid-router:8888"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
       POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
       MOCK_LLM: "${MOCK_LLM:-1}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
-      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
       NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
       NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
       NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
-      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
-      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
     ports:
       - "8004:8004"
     depends_on:
       servicebus-emulator:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
       elasticsearch:
@@ -419,28 +478,27 @@ services:
       SERVICE_NAME: api
       SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
       REDIS_URL: "redis://redis:6379/0"
-      DRUID_URL: "http://druid:8888"
+      DRUID_URL: "http://druid-router:8888"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
       POSTGRES_DSN: "postgresql+asyncpg://${POSTGRES_USER:-mip}:${POSTGRES_PASSWORD:-mip_local}@postgres:5432/${POSTGRES_DB:-mip}"
       MOCK_LLM: "${MOCK_LLM:-1}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-auto}"
-      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-auto}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
       NEW_RELIC_CONFIG_FILE: "${NEW_RELIC_CONFIG_FILE:-}"
       NEW_RELIC_APP_NAME: "${NEW_RELIC_APP_NAME:-}"
       NEW_RELIC_ENVIRONMENT: "${NEW_RELIC_ENVIRONMENT:-}"
-      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
-      AZURE_OPENAI_ENDPOINT: "${AZURE_OPENAI_ENDPOINT:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
     ports:
       - "8000:8005"
     depends_on:
       servicebus-emulator:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
-      druid:
+      druid-router:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy

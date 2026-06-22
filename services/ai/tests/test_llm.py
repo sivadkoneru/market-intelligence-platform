@@ -7,13 +7,11 @@ import pytest
 
 from libs.common.config import Settings
 from services.ai.llm import (
-    AnthropicProvider,
-    AzureOpenAIProvider,
-    ChatMessage,
     ContextDocument,
     EmbeddingRequest,
     GenerationRequest,
     MockLLMProvider,
+    OpenAIProvider,
     apply_guardrails,
     evaluate_result,
     get_embedding_provider,
@@ -78,30 +76,54 @@ async def test_mock_embeddings_are_stable_and_have_expected_shape() -> None:
     assert first.vectors[0] != first.vectors[1]
 
 
-def test_factory_defaults_to_mock_and_prefers_configured_providers() -> None:
+def test_factory_defaults_to_mock_when_offline() -> None:
     default_settings = Settings()
     assert isinstance(get_llm_provider(default_settings), MockLLMProvider)
     assert isinstance(get_embedding_provider(default_settings), MockLLMProvider)
 
-    azure_settings = Settings(
-        mock_llm=False,
-        azure_openai_api_key="key",
-        azure_openai_endpoint="https://azure.example",
-    )
-    assert isinstance(get_llm_provider(azure_settings), AzureOpenAIProvider)
-    assert isinstance(get_embedding_provider(azure_settings), AzureOpenAIProvider)
+    bundle = get_provider_bundle(default_settings)
+    assert isinstance(bundle.generator, MockLLMProvider)
+    assert isinstance(bundle.embedder, MockLLMProvider)
 
-    anthropic_settings = Settings(
-        mock_llm=False,
-        anthropic_api_key="anthropic-key",
-    )
-    assert isinstance(get_llm_provider(anthropic_settings), AnthropicProvider)
-    with pytest.raises(RuntimeError, match="Configure Azure OpenAI embeddings"):
-        get_embedding_provider(anthropic_settings)
 
-    bundle = get_provider_bundle(azure_settings)
-    assert isinstance(bundle.generator, AzureOpenAIProvider)
-    assert isinstance(bundle.embedder, AzureOpenAIProvider)
+def test_factory_uses_openai_when_live_with_api_key() -> None:
+    settings = Settings(mock_llm=False, openai_api_key="sk-test")
+    assert isinstance(get_llm_provider(settings), OpenAIProvider)
+    assert isinstance(get_embedding_provider(settings), OpenAIProvider)
+
+    bundle = get_provider_bundle(settings)
+    assert isinstance(bundle.generator, OpenAIProvider)
+    assert isinstance(bundle.embedder, OpenAIProvider)
+
+
+def test_factory_keeps_mock_when_mock_llm_set_even_with_key() -> None:
+    settings = Settings(mock_llm=True, openai_api_key="sk-test")
+    assert isinstance(get_llm_provider(settings), MockLLMProvider)
+    assert isinstance(get_embedding_provider(settings), MockLLMProvider)
+
+
+def test_factory_raises_when_live_without_api_key() -> None:
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        get_llm_provider(Settings(mock_llm=False))
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        get_embedding_provider(Settings(mock_llm=False))
+
+
+def test_factory_injects_configured_model_names() -> None:
+    provider = get_llm_provider(
+        Settings(
+            mock_llm=False,
+            openai_api_key="sk-test",
+            openai_base_url="https://proxy.example/v1",
+            openai_chat_model="gpt-custom",
+            openai_embedding_model="embed-custom",
+        )
+    )
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._chat_model == "gpt-custom"
+    assert provider._embedding_model == "embed-custom"
+    assert provider._base_url == "https://proxy.example/v1"
 
 
 def test_context_document_citation_prefers_url_then_metadata() -> None:
@@ -124,59 +146,12 @@ def test_context_document_citation_prefers_url_then_metadata() -> None:
     )
 
 
-def test_factory_honors_explicit_provider_selection_with_multiple_credentials() -> None:
-    settings = Settings(
-        mock_llm=False,
-        llm_provider="anthropic",
-        azure_openai_api_key="azure-key",
-        azure_openai_endpoint="https://azure.example",
-        anthropic_api_key="anthropic-key",
-    )
-    assert isinstance(get_llm_provider(settings), AnthropicProvider)
-
-    azure_settings = Settings(
-        mock_llm=True,
-        llm_provider="azure_openai",
-        azure_openai_api_key="azure-key",
-        azure_openai_endpoint="https://azure.example",
-        anthropic_api_key="anthropic-key",
-    )
-    assert isinstance(get_llm_provider(azure_settings), AzureOpenAIProvider)
-
-
-def test_factory_raises_helpful_errors_for_explicit_missing_credentials() -> None:
-    with pytest.raises(RuntimeError, match="LLM provider 'azure_openai' requires"):
-        get_llm_provider(Settings(mock_llm=False, llm_provider="azure_openai"))
-
-    with pytest.raises(RuntimeError, match="LLM provider 'anthropic' requires"):
-        get_llm_provider(Settings(mock_llm=False, llm_provider="anthropic"))
-
-    with pytest.raises(RuntimeError, match="Embedding provider 'azure_openai' requires"):
-        get_embedding_provider(Settings(mock_llm=False, embedding_provider="azure_openai"))
-
-
-def test_factory_raises_for_anthropic_without_real_embeddings_when_not_in_mock_mode() -> None:
-    settings = Settings(
-        mock_llm=False,
-        llm_provider="anthropic",
-        embedding_provider="auto",
-        anthropic_api_key="anthropic-key",
-    )
-
-    with pytest.raises(RuntimeError, match="Configure Azure OpenAI embeddings"):
-        get_provider_bundle(settings)
-
-
-def test_import_guards_raise_helpful_error_without_optional_sdks(
+def test_import_guard_raises_helpful_error_without_openai_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setitem(sys.modules, "openai", None)
     with pytest.raises(RuntimeError, match="openai package is required"):
-        AzureOpenAIProvider(api_key="key", endpoint="https://azure.example")._get_client()
-
-    monkeypatch.setitem(sys.modules, "anthropic", None)
-    with pytest.raises(RuntimeError, match="anthropic package is required"):
-        AnthropicProvider(api_key="key")._get_client()
+        OpenAIProvider(api_key="key")._get_client()
 
 
 class _FakeOpenAIClient:
@@ -216,39 +191,14 @@ class _FakeOpenAIClient:
         }
 
 
-class _FakeAnthropicClient:
-    def __init__(self) -> None:
-        self.messages = SimpleNamespace(create=self._messages_create)
-        self.calls: list[dict[str, object]] = []
-
-    async def _messages_create(self, **kwargs: object) -> object:
-        self.calls.append(dict(kwargs))
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        '{"summary":"Neutral headline impact.",'
-                        '"explanation":"The explanation cites '
-                        'https://example.test/btc-2 and stays grounded.",'
-                        '"sentiment_score":0.1,'
-                        '"sentiment_label":"neutral",'
-                        '"citations":["https://example.test/btc-2"],'
-                        '"confidence":0.67}'
-                    ),
-                }
-            ]
-        }
-
-
 @pytest.mark.asyncio
-async def test_azure_provider_parses_fake_chat_and_embeddings() -> None:
+async def test_openai_provider_parses_fake_chat_and_embeddings() -> None:
     fake_client = _FakeOpenAIClient()
-    provider = AzureOpenAIProvider(
+    provider = OpenAIProvider(
         api_key="key",
-        endpoint="https://azure.example",
-        chat_deployment="gpt-test",
-        embedding_deployment="embed-test",
+        base_url="https://api.openai.com/v1",
+        chat_model="gpt-test",
+        embedding_model="embed-test",
         client=fake_client,
     )
 
@@ -256,72 +206,17 @@ async def test_azure_provider_parses_fake_chat_and_embeddings() -> None:
     result = await provider.generate(request)
     embeddings = await provider.embed(EmbeddingRequest(texts=("a", "b"), dimensions=3))
 
-    assert result.provider == "azure_openai"
+    assert result.provider == "openai"
     assert result.model == "gpt-test"
     assert result.grounded is True
     assert result.sentiment_score == 0.64
-    assert embeddings.provider == "azure_openai"
+    assert embeddings.provider == "openai"
     assert embeddings.model == "embed-test"
     assert embeddings.vectors == ((0.1, 0.2, 0.3), (0.3, 0.2, 0.1))
     assert fake_client.chat_calls[0]["model"] == "gpt-test"
     assert fake_client.embedding_calls[0]["model"] == "embed-test"
     assert fake_client.embedding_calls[0]["dimensions"] == 3
     assert isinstance(fake_client.chat_calls[0]["messages"], list)
-
-
-@pytest.mark.asyncio
-async def test_anthropic_provider_parses_fake_response() -> None:
-    fake_client = _FakeAnthropicClient()
-    provider = AnthropicProvider(
-        api_key="anthropic-key",
-        model="claude-test",
-        client=fake_client,
-    )
-
-    result = await provider.generate(_request())
-
-    assert result.provider == "anthropic"
-    assert result.model == "claude-test"
-    assert result.sentiment_label == "neutral"
-    assert result.citations == ("https://example.test/btc-2",)
-    assert fake_client.calls[0]["model"] == "claude-test"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_provider_preserves_chat_history_roles() -> None:
-    fake_client = _FakeAnthropicClient()
-    provider = AnthropicProvider(
-        api_key="anthropic-key",
-        model="claude-test",
-        client=fake_client,
-    )
-    request = GenerationRequest(
-        prompt="ignored when explicit messages are present",
-        system_prompt="Use only provided context.",
-        messages=(
-            ChatMessage(role="system", content="Cite sources directly."),
-            ChatMessage(role="user", content="What changed for BTC today?"),
-            ChatMessage(role="assistant", content="BTC rallied after margin improvements."),
-            ChatMessage(role="user", content="Give me a grounded summary."),
-        ),
-        context=(
-            ContextDocument(
-                doc_id="doc-2",
-                url="https://example.test/btc-2",
-                title="ETF inflows stay positive",
-                text="ETF inflows remained positive and traders described the tone as bullish.",
-            ),
-        ),
-    )
-
-    await provider.generate(request)
-
-    assert fake_client.calls[0]["system"] == "Use only provided context.\n\nCite sources directly."
-    assert fake_client.calls[0]["messages"] == [
-        {"role": "user", "content": "What changed for BTC today?"},
-        {"role": "assistant", "content": "BTC rallied after margin improvements."},
-        {"role": "user", "content": "Give me a grounded summary."},
-    ]
 
 
 def test_guardrails_accept_grounded_output_and_reject_ungrounded_output() -> None:

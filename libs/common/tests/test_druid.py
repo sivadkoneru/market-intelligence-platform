@@ -132,6 +132,94 @@ async def test_query_sql_count():
 
 
 # ---------------------------------------------------------------------------
+# DruidClient.query_sql — HTTP error handling (mocked httpx)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAsyncClient:
+    """Minimal async-context stand-in for httpx.AsyncClient that returns a
+    pre-built response from post()."""
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, *args, **kwargs):
+        return self._response
+
+
+def _patch_httpx(monkeypatch, response):
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _FakeAsyncClient(response))
+
+
+def _druid_response(status_code: int, *, json_body=None, text: str = ""):
+    import httpx
+
+    req = httpx.Request("POST", "http://druid-router:8888/druid/v2/sql")
+    if json_body is not None:
+        return httpx.Response(status_code, json=json_body, request=req)
+    return httpx.Response(status_code, text=text, request=req)
+
+
+@pytest.mark.asyncio
+async def test_query_sql_missing_datasource_returns_empty(monkeypatch):
+    """A not-yet-created datasource (Druid 400 'Object ... not found') reads as empty."""
+    resp = _druid_response(
+        400,
+        json_body={
+            "errorCode": "invalidInput",
+            "errorMessage": "Object 'ticks' not found (line [1], column [29])",
+        },
+    )
+    _patch_httpx(monkeypatch, resp)
+    client = DruidClient("http://druid-router:8888")
+    assert await client.query_sql("SELECT DISTINCT symbol FROM ticks") == []
+
+
+@pytest.mark.asyncio
+async def test_latest_returns_none_when_datasource_missing(monkeypatch):
+    """latest() builds on query_sql; missing datasource → None (so callers 404, not 500)."""
+    resp = _druid_response(
+        400, json_body={"errorMessage": "Object 'ticks' not found"}
+    )
+    _patch_httpx(monkeypatch, resp)
+    client = DruidClient("http://druid-router:8888")
+    assert await client.latest("BTCUSDT") is None
+
+
+@pytest.mark.asyncio
+async def test_query_sql_other_400_still_raises(monkeypatch):
+    """A genuine SQL error (e.g. unknown column) must NOT be swallowed as empty."""
+    import httpx
+
+    resp = _druid_response(
+        400, json_body={"errorMessage": "Column 'nope' not found in any table"}
+    )
+    _patch_httpx(monkeypatch, resp)
+    client = DruidClient("http://druid-router:8888")
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.query_sql("SELECT nope FROM ticks")
+
+
+@pytest.mark.asyncio
+async def test_query_sql_server_error_still_raises(monkeypatch):
+    import httpx
+
+    resp = _druid_response(500, text="boom")
+    _patch_httpx(monkeypatch, resp)
+    client = DruidClient("http://druid-router:8888")
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.query_sql("SELECT 1")
+
+
+# ---------------------------------------------------------------------------
 # Druid ingest spec builder
 # ---------------------------------------------------------------------------
 

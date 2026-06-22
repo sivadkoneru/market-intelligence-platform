@@ -13,6 +13,7 @@ Short architecture decision records for choices already present in the repo.
 | `0003-shared-schema-common-clients.md` | Shared Pydantic events and common client ports in `libs/common` |
 | `0004-mock-first-llm-rag-guardrails.md` | MOCK_LLM default, import-guarded real providers, and guardrails on all generations |
 | `0005-observability-grafana.md` | Structured logs, service metrics, and Grafana provisioning over Elasticsearch and Druid |
+| `0006-openai-compatible-llm-provider.md` | Single OpenAI-compatible provider for every live backend (via `OPENAI_BASE_URL`); mock stays the offline default |
 
 ## Writing Style
 

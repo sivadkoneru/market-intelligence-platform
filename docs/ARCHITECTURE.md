@@ -80,7 +80,7 @@ The local compose stack mirrors the production-shaped dependency graph:
 - Azure Service Bus emulator plus SQL Server backing store
 - PostgreSQL 16 for app metadata and the Druid metadata store
 - ZooKeeper for Druid coordination
-- Apache Druid 30 in micro-quickstart mode for local development
+- Apache Druid 37 in micro-quickstart mode for local development, run as one container per service (coordinator, broker, historical, middleManager, router) because the apache/druid image runs a single named service per container
 - Redis 7 for snapshots, caches, and idempotency markers
 - Elasticsearch 8 for structured logs and kNN retrieval
 - Grafana 11 for dashboards over Elasticsearch and Druid

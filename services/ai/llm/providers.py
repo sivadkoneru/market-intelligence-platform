@@ -20,8 +20,7 @@ __all__ = [
     "EmbeddingProvider",
     "LLMProvider",
     "MockLLMProvider",
-    "AzureOpenAIProvider",
-    "AnthropicProvider",
+    "OpenAIProvider",
 ]
 
 POSITIVE_HINTS = {
@@ -132,28 +131,6 @@ def _message_payload(request: GenerationRequest) -> list[dict[str, str]]:
             content = f"{request.prompt}\n\nContext:\n" + "\n".join(context_lines)
         messages.append({"role": "user", "content": content})
     return messages
-
-
-def _anthropic_message_payload(request: GenerationRequest) -> list[dict[str, str]]:
-    if request.messages:
-        return [
-            {"role": message.role, "content": message.content}
-            for message in request.messages
-            if message.role in {"user", "assistant"}
-        ]
-
-    user_messages = [message for message in _message_payload(request) if message["role"] == "user"]
-    return user_messages or [{"role": "user", "content": request.prompt}]
-
-
-def _anthropic_system_prompt(request: GenerationRequest) -> str:
-    parts: list[str] = []
-    if request.system_prompt:
-        parts.append(request.system_prompt)
-    parts.extend(
-        message.content for message in request.messages if message.role == "system"
-    )
-    return "\n\n".join(part for part in parts if part)
 
 
 def _fake_sentiment(text: str) -> float:
@@ -305,47 +282,48 @@ class MockLLMProvider(LLMProvider, EmbeddingProvider):
         )
 
 
-class AzureOpenAIProvider(LLMProvider, EmbeddingProvider):
-    """Azure OpenAI chat-completions and embeddings provider with lazy SDK import."""
+class OpenAIProvider(LLMProvider, EmbeddingProvider):
+    """OpenAI-compatible chat-completions and embeddings provider.
+
+    Talks to any endpoint that implements the OpenAI Chat Completions and Embeddings
+    APIs — OpenAI itself, Azure OpenAI's ``/openai/v1`` route, Anthropic's ``/v1``
+    compatibility layer, OpenRouter, or a local vLLM/llama.cpp server — selected via
+    ``base_url``. The SDK import is lazy, so the offline test path never needs the
+    ``openai`` package installed.
+    """
 
     def __init__(
         self,
         *,
         api_key: str | None,
-        endpoint: str | None,
-        chat_deployment: str = "gpt-4o-mini",
-        embedding_deployment: str = "text-embedding-3-small",
-        api_version: str = "2024-10-21",
+        base_url: str | None = None,
+        chat_model: str = "gpt-4o-mini",
+        embedding_model: str = "text-embedding-3-small",
         client: Any | None = None,
     ) -> None:
         self._api_key = api_key
-        self._endpoint = endpoint
-        self._chat_deployment = chat_deployment
-        self._embedding_deployment = embedding_deployment
-        self._api_version = api_version
+        self._base_url = base_url
+        self._chat_model = chat_model
+        self._embedding_model = embedding_model
         self._client = client
 
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
         try:
-            from openai import AsyncAzureOpenAI  # type: ignore
+            from openai import AsyncOpenAI  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "openai package is required for AzureOpenAIProvider when no client is injected"
+                "openai package is required for OpenAIProvider when no client is injected"
             ) from exc
 
-        self._client = AsyncAzureOpenAI(
-            api_key=self._api_key,
-            azure_endpoint=self._endpoint,
-            api_version=self._api_version,
-        )
+        self._client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
         return self._client
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         client = self._get_client()
         response = await client.chat.completions.create(
-            model=self._chat_deployment,
+            model=self._chat_model,
             messages=_message_payload(request),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
@@ -355,8 +333,8 @@ class AzureOpenAIProvider(LLMProvider, EmbeddingProvider):
         raw_text = _extract_text(_get_attr(message, "content", ""))
         payload = _parse_json_result(raw_text)
         result = _structured_from_payload(
-            provider="azure_openai",
-            model=self._chat_deployment,
+            provider="openai",
+            model=self._chat_model,
             payload=payload,
             raw_text=raw_text,
         )
@@ -366,7 +344,7 @@ class AzureOpenAIProvider(LLMProvider, EmbeddingProvider):
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResult:
         client = self._get_client()
         response = await client.embeddings.create(
-            model=self._embedding_deployment,
+            model=self._embedding_model,
             input=list(request.texts),
             dimensions=request.dimensions,
         )
@@ -374,55 +352,7 @@ class AzureOpenAIProvider(LLMProvider, EmbeddingProvider):
         vectors = tuple(tuple(float(x) for x in _get_attr(row, "embedding", ())) for row in data)
         return EmbeddingResult(
             vectors=vectors,
-            provider="azure_openai",
-            model=self._embedding_deployment,
+            provider="openai",
+            model=self._embedding_model,
             dimensions=len(vectors[0]) if vectors else request.dimensions,
         )
-
-
-class AnthropicProvider(LLMProvider):
-    """Anthropic Claude provider with lazy SDK import."""
-
-    def __init__(
-        self,
-        *,
-        api_key: str | None,
-        model: str = "claude-3-5-sonnet-latest",
-        client: Any | None = None,
-    ) -> None:
-        self._api_key = api_key
-        self._model = model
-        self._client = client
-
-    def _get_client(self) -> Any:
-        if self._client is not None:
-            return self._client
-        try:
-            from anthropic import AsyncAnthropic  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "anthropic package is required for AnthropicProvider when no client is injected"
-            ) from exc
-
-        self._client = AsyncAnthropic(api_key=self._api_key)
-        return self._client
-
-    async def generate(self, request: GenerationRequest) -> GenerationResult:
-        client = self._get_client()
-        response = await client.messages.create(
-            model=self._model,
-            system=_anthropic_system_prompt(request),
-            messages=_anthropic_message_payload(request),
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
-        raw_text = _extract_text(_get_attr(response, "content", ""))
-        payload = _parse_json_result(raw_text)
-        result = _structured_from_payload(
-            provider="anthropic",
-            model=self._model,
-            payload=payload,
-            raw_text=raw_text,
-        )
-        guarded, _ = apply_guardrails(request, result)
-        return guarded
