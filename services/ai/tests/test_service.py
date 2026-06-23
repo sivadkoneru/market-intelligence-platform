@@ -60,6 +60,23 @@ class UnguardedLLMProvider(MockLLMProvider):
         )
 
 
+class FlakyReceiveBus(InMemoryBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 0
+
+    async def receive(
+        self,
+        topic: str,
+        subscription: str,
+        max_messages: int = 10,
+    ):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ConnectionError("service bus not ready")
+        return await super().receive(topic, subscription, max_messages=max_messages)
+
+
 def _news_message(
     *,
     symbol: str = "BTCUSDT",
@@ -368,4 +385,47 @@ def test_app_lifespan_starts_background_worker() -> None:
                 break
             asyncio.run(asyncio.sleep(0.01))
 
+    assert len(insights) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_forever_retries_after_transient_poll_failure() -> None:
+    bus = FlakyReceiveBus()
+    cache = InMemoryCache()
+    search_store = InMemorySearchStore()
+    provider = MockLLMProvider()
+    await bus.receive(TOPIC_NEWS_RAW, AI_SUBSCRIPTION, max_messages=0)
+    await bus.receive(TOPIC_SIGNALS, AI_SUBSCRIPTION, max_messages=0)
+    await bus.receive(TOPIC_INSIGHTS, "observer", max_messages=0)
+    bus.failures_remaining = 1
+
+    body, message_id = _news_message(message_id="ai-retry")
+    await bus.publish(TOPIC_NEWS_RAW, body, message_id=message_id)
+    service = AIAnalysisService(
+        bus=bus,
+        cache=cache,
+        search_store=search_store,
+        rag_pipeline=RAGPipeline(
+            search_store=search_store,
+            embedding_provider=provider,
+        ),
+        llm_provider=provider,
+    )
+
+    worker = asyncio.create_task(
+        service.run_forever(poll_interval_seconds=0.01, max_messages=1)
+    )
+    try:
+        for _ in range(50):
+            if service.metrics.messages_processed:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    assert service.metrics.messages_processed == 1
+    assert service.metrics.last_error == "ai polling failed: ConnectionError: service bus not ready"
+    insights = await bus.peek(TOPIC_INSIGHTS, "observer", n=10)
     assert len(insights) == 1

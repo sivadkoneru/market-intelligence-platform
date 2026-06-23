@@ -56,6 +56,9 @@ class Cache(Protocol):
     async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
         ...
 
+    async def list_snapshot_symbols(self) -> list[str]:
+        ...
+
     async def seen(self, key: str) -> bool:
         """Idempotency check: returns False the first time, True every subsequent time."""
         ...
@@ -119,6 +122,18 @@ class InMemoryCache:
     async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
         return await self.get(f"snapshot:{symbol}")
 
+    async def list_snapshot_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        for key in list(self._store):
+            if not key.startswith("snapshot:"):
+                continue
+            if await self.get(key) is None:
+                continue
+            symbol = key.removeprefix("snapshot:")
+            if symbol:
+                symbols.append(symbol)
+        return sorted(symbols)
+
     async def seen(self, key: str) -> bool:
         if key in self._seen_keys:
             return True
@@ -179,6 +194,15 @@ class RedisCache:
 
     async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
         return await self.get(f"snapshot:{symbol}")
+
+    async def list_snapshot_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        async for key in self._client.scan_iter(match="snapshot:*"):
+            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            symbol = key_text.removeprefix("snapshot:")
+            if symbol:
+                symbols.append(symbol)
+        return sorted(symbols)
 
     async def seen(self, key: str) -> bool:
         """

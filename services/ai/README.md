@@ -53,6 +53,7 @@ uvicorn services.ai.app:app --host 0.0.0.0 --port 8003
 - `pydantic`
 - `structlog`
 - Shared offline-safe ports from `libs/common`
+- `openai` SDK, imported lazily only when `MOCK_LLM=0`
 - Existing `services.ai.llm` and `services.ai.rag` modules
 
 The tested path is fully offline with `MockLLMProvider`, `InMemorySearchStore`,
@@ -95,9 +96,9 @@ is lazy so the tested path stays offline.
 | Mode | Class | Trigger |
 |---|---|---|
 | Offline (default) | `MockLLMProvider` | `MOCK_LLM=1` |
-| Live | `OpenAIProvider` | `MOCK_LLM=0` **and** `OPENAI_API_KEY` set |
+| Live | `OpenAIProvider` | `MOCK_LLM=0` |
 
-`MOCK_LLM=0` without `OPENAI_API_KEY` raises a clear configuration error.
+`OPENAI_API_KEY` may be empty for local OpenAI-compatible servers such as LM Studio.
 
 The OpenAI Chat Completions + Embeddings shape is supported by every major provider, so a
 single client reaches all of them via `OPENAI_BASE_URL`:
@@ -108,7 +109,7 @@ single client reaches all of them via `OPENAI_BASE_URL`:
 | Azure OpenAI | `https://<resource>.openai.azure.com/openai/v1` |
 | Anthropic | `https://api.anthropic.com/v1` |
 | OpenRouter | `https://openrouter.ai/api/v1` |
-| Local (vLLM, llama.cpp) | `http://localhost:8001/v1` |
+| Local (LM Studio, vLLM, llama.cpp) | `http://localhost:8001/v1` |
 
 To go live (example: OpenAI):
 

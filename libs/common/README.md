@@ -263,6 +263,7 @@ await cache.set("my-key", {"val": 1}, ttl=300)
 data = await cache.get("my-key")
 await cache.set_snapshot("BTCUSDT", indicators_dict)
 snap = await cache.get_snapshot("BTCUSDT")
+symbols = await cache.list_snapshot_symbols()
 
 # Idempotency
 if not await cache.seen("event-id-xyz"):

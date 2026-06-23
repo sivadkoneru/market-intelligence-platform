@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from inspect import isawaitable
 from typing import Any
 
@@ -28,6 +28,7 @@ from libs.common import (
 API_SUBSCRIPTION = "api"
 API_WS_SUBSCRIPTION = "api-ws"
 INSIGHT_CACHE_PREFIX = "insight"
+HISTORY_PREFIX = "history"
 INSIGHT_BUS_FALLBACK_LIMIT = 1_000
 STREAM_POLL_INTERVAL_SECONDS = 0.05
 TopicModel = type[MarketEvent] | type[Signal] | type[Alert] | type[Insight]
@@ -335,17 +336,58 @@ class APIService:
     async def list_symbols(self) -> list[str]:
         self.metrics.symbols_requests += 1
         self.metrics.requests_total += 1
-        rows = await self._rows_for_tables(("ticks", "indicators"))
+        candidate_tables = ("ticks", "indicators")
+        table_rows = await self._store.query_sql(
+            """
+            SELECT "TABLE_NAME"
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE "TABLE_SCHEMA" = 'druid'
+              AND "TABLE_NAME" IN ('ticks', 'indicators')
+            """
+        )
+        known_tables = {
+            str(row["TABLE_NAME"])
+            for row in table_rows
+            if row.get("TABLE_NAME")
+        }
+        rows: list[dict[str, Any]] = []
+        for table in candidate_tables:
+            if table not in known_tables:
+                continue
+            rows.extend(
+                await self._store.query_sql(
+                    f"""
+                    SELECT DISTINCT "symbol" AS "symbol"
+                    FROM "{table}"
+                    WHERE "symbol" IS NOT NULL
+                    """
+                )
+            )
         symbols = {
             str(row["symbol"])
             for row in rows
             if row.get("symbol")
         }
+        symbols.update(await self._cache.list_snapshot_symbols())
         return sorted(symbols)
 
     async def latest_market(self, symbol: str) -> dict[str, Any] | None:
         self.metrics.latest_requests += 1
         self.metrics.requests_total += 1
+        snapshot = await self._cache.get_snapshot(symbol)
+        if snapshot is not None:
+            return self._normalise_row(
+                {
+                    "symbol": symbol,
+                    "ts": snapshot.get("ts"),
+                    "source": snapshot.get("source"),
+                    "event_type": snapshot.get("event_type"),
+                    "price": snapshot.get("price"),
+                    "volume": snapshot.get("volume"),
+                    "bid": snapshot.get("bid"),
+                    "ask": snapshot.get("ask"),
+                }
+            )
         row = await self._store.latest(symbol)
         return self._normalise_row(row)
 
@@ -359,7 +401,12 @@ class APIService:
         self.metrics.history_requests += 1
         self.metrics.requests_total += 1
         rows = await self._store.history(symbol, frm, to)
-        return [self._normalise_row(row) for row in sorted(rows, key=self._ts_sort_key)]
+        cached_rows = await self._cached_history(symbol, frm=frm, to=to)
+        merged_rows = self._dedupe_rows([*rows, *cached_rows])
+        return [
+            self._normalise_row(row)
+            for row in sorted(merged_rows, key=self._ts_sort_key)
+        ]
 
     async def indicators(self, symbol: str) -> dict[str, Any] | None:
         self.metrics.indicators_requests += 1
@@ -466,6 +513,42 @@ class APIService:
             rows.extend(await self._store.query_sql(f'SELECT * FROM "{table}"'))
         return rows
 
+    async def _cached_history(
+        self,
+        symbol: str,
+        *,
+        frm: datetime,
+        to: datetime,
+    ) -> list[dict[str, Any]]:
+        history = await self._cache.get(f"{HISTORY_PREFIX}:{symbol}")
+        if not isinstance(history, list):
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for row in history:
+            if not isinstance(row, dict) or row.get("symbol") != symbol:
+                continue
+            ts = self._parse_ts(row.get("ts") or row.get("__time"))
+            if ts is None or not self._within_range(ts, frm=frm, to=to):
+                continue
+            rows.append(row)
+        return rows
+
+    @classmethod
+    def _dedupe_rows(cls, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            ts = cls._parse_ts(row.get("ts") or row.get("__time"))
+            raw_ts = row.get("ts") or row.get("__time") or ""
+            ts_key = ts.isoformat() if ts is not None else str(raw_ts)
+            key = (
+                str(row.get("event_id") or ""),
+                str(row.get("symbol") or ""),
+                ts_key,
+            )
+            deduped[key] = row
+        return list(deduped.values())
+
     def _validated_payloads(
         self,
         messages: Sequence[Any],
@@ -494,6 +577,35 @@ class APIService:
         if hasattr(ts, "isoformat"):
             normalised["ts"] = ts.isoformat()
         return normalised
+
+    @staticmethod
+    def _parse_ts(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _within_range(cls, ts: datetime, *, frm: datetime, to: datetime) -> bool:
+        return (
+            cls._normalise_datetime(frm)
+            <= cls._normalise_datetime(ts)
+            <= cls._normalise_datetime(to)
+        )
+
+    @staticmethod
+    def _normalise_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
 
     @staticmethod
     def _ts_sort_key(row: dict[str, Any]) -> tuple[int, str]:

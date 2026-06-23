@@ -97,6 +97,17 @@ def _stable_embedding(text: str, dimensions: int) -> tuple[float, ...]:
     return tuple(round(value / norm, 6) for value in values)
 
 
+def _coerce_embedding_dimensions(
+    vector: tuple[float, ...],
+    dimensions: int,
+) -> tuple[float, ...]:
+    if len(vector) == dimensions:
+        return vector
+    if len(vector) > dimensions:
+        return vector[:dimensions]
+    return (*vector, *([0.0] * (dimensions - len(vector))))
+
+
 def _context_blob(context: tuple[ContextDocument, ...]) -> str:
     parts = []
     for document in context:
@@ -200,6 +211,59 @@ def _structured_from_payload(
         sentiment_label=sentiment_label,
         citations=citations,
         confidence=round(_clamp(float(payload.get("confidence", 0.0)), 0.0, 1.0), 3),
+        grounded=bool(citations),
+        provider=provider,
+        model=model,
+        raw_text=raw_text,
+    )
+
+
+def _structured_from_text(
+    *,
+    provider: str,
+    model: str,
+    raw_text: str,
+    request: GenerationRequest,
+) -> GenerationResult:
+    citations = tuple(document.citation for document in request.context if document.citation)
+    top_doc = request.context[0] if request.context else None
+    context_summary = _first_sentence(top_doc.text) if top_doc else ""
+    prompt_summary = _first_sentence(request.prompt)
+    score = _fake_sentiment(
+        "\n".join(
+            part
+            for part in (
+                request.prompt,
+                raw_text,
+                context_summary,
+            )
+            if part
+        )
+    )
+    sentiment_label = _normalize_label(score)
+    summary = _first_sentence(raw_text)
+    if not summary:
+        summary = (
+            f"{sentiment_label.title()} outlook for "
+            f"{request.metadata.get('symbol', 'the asset')}: "
+            f"{context_summary or prompt_summary or 'retrieved context is limited'}."
+        )
+    explanation = raw_text.strip()
+    if not explanation:
+        if top_doc:
+            explanation = (
+                f"Grounded in {top_doc.citation}, the main context is "
+                f"{context_summary or top_doc.title or 'the retrieved document'}."
+            )
+        else:
+            explanation = prompt_summary or summary
+    return GenerationResult(
+        summary=summary,
+        explanation=explanation,
+        sentiment_score=score,
+        sentiment_label=sentiment_label,
+        citations=citations,
+        confidence=0.5 if citations else 0.25,
         grounded=bool(citations),
         provider=provider,
         model=model,
@@ -331,13 +395,21 @@ class OpenAIProvider(LLMProvider, EmbeddingProvider):
         choice = _get_attr(response, "choices", [])[0]
         message = _get_attr(choice, "message", {})
         raw_text = _extract_text(_get_attr(message, "content", ""))
-        payload = _parse_json_result(raw_text)
-        result = _structured_from_payload(
-            provider="openai",
-            model=self._chat_model,
-            payload=payload,
-            raw_text=raw_text,
-        )
+        try:
+            payload = _parse_json_result(raw_text)
+            result = _structured_from_payload(
+                provider="openai",
+                model=self._chat_model,
+                payload=payload,
+                raw_text=raw_text,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            result = _structured_from_text(
+                provider="openai",
+                model=self._chat_model,
+                raw_text=raw_text,
+                request=request,
+            )
         guarded, _ = apply_guardrails(request, result)
         return guarded
 
@@ -349,10 +421,16 @@ class OpenAIProvider(LLMProvider, EmbeddingProvider):
             dimensions=request.dimensions,
         )
         data = _get_attr(response, "data", [])
-        vectors = tuple(tuple(float(x) for x in _get_attr(row, "embedding", ())) for row in data)
+        vectors = tuple(
+            _coerce_embedding_dimensions(
+                tuple(float(x) for x in _get_attr(row, "embedding", ())),
+                request.dimensions,
+            )
+            for row in data
+        )
         return EmbeddingResult(
             vectors=vectors,
             provider="openai",
             model=self._embedding_model,
-            dimensions=len(vectors[0]) if vectors else request.dimensions,
+            dimensions=request.dimensions,
         )

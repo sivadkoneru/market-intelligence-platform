@@ -103,10 +103,30 @@ class InMemoryTimeSeriesStore:
     async def query_sql(self, sql: str) -> list[dict[str, Any]]:
         """
         Minimal SQL execution for tests.
-        Only handles ``SELECT COUNT(*) FROM <table>`` and full-table SELECT.
+        Handles table metadata, distinct symbols, ``SELECT COUNT(*) FROM <table>``,
+        and full-table SELECT.
         Real SQL is executed by DruidClient against the live endpoint.
         """
-        sql_lower = sql.strip().lower()
+        sql_clean = " ".join(sql.strip().split())
+        sql_lower = sql_clean.lower()
+        if "information_schema.tables" in sql_lower:
+            has_table_name_filter = '"table_name" in' in sql_lower or " table_name in " in sql_lower
+            return [
+                {"TABLE_NAME": table}
+                for table in sorted(self._tables)
+                if f"'{table}'" in sql_lower or not has_table_name_filter
+            ]
+        if "select distinct" in sql_lower and "symbol" in sql_lower:
+            try:
+                table = sql_lower.split("from")[1].strip().split()[0].strip('"')
+            except IndexError:
+                return []
+            symbols = {
+                str(row["symbol"])
+                for row in self._tables.get(table, [])
+                if row.get("symbol")
+            }
+            return [{"symbol": symbol} for symbol in sorted(symbols)]
         if "count(*)" in sql_lower:
             # Extract table name
             try:
@@ -178,6 +198,10 @@ class DruidClient:
         self._base_url = url.rstrip("/")
 
     @staticmethod
+    def _sql_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    @staticmethod
     def _build_ingest_specs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
             return []
@@ -204,6 +228,7 @@ class DruidClient:
                         },
                         "ioConfig": {
                             "type": "index_parallel",
+                            "appendToExisting": True,
                             "inputSource": {
                                 "type": "inline",
                                 "data": "\n".join(json.dumps(r) for r in table_rows),
@@ -262,8 +287,9 @@ class DruidClient:
 
     async def latest(self, symbol: str) -> dict[str, Any] | None:
         sql = (
-            f"SELECT * FROM ticks WHERE symbol = '{symbol}' "
-            "ORDER BY ts DESC LIMIT 1"
+            'SELECT * FROM "ticks" '
+            f'WHERE "symbol" = {self._sql_literal(symbol)} '
+            'ORDER BY "__time" DESC LIMIT 1'
         )
         rows = await self.query_sql(sql)
         return rows[0] if rows else None
@@ -275,9 +301,11 @@ class DruidClient:
         to: datetime,
     ) -> list[dict[str, Any]]:
         sql = (
-            f"SELECT * FROM ticks WHERE symbol = '{symbol}' "
-            f"AND ts >= '{frm.isoformat()}' AND ts <= '{to.isoformat()}' "
-            "ORDER BY ts ASC"
+            'SELECT * FROM "ticks" '
+            f'WHERE "symbol" = {self._sql_literal(symbol)} '
+            f'AND "__time" >= {self._sql_literal(frm.isoformat())} '
+            f'AND "__time" <= {self._sql_literal(to.isoformat())} '
+            'ORDER BY "__time" ASC'
         )
         return await self.query_sql(sql)
 

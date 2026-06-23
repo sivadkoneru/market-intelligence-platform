@@ -33,7 +33,6 @@ __all__ = [
 
 _FAKE_CONN_STRINGS = {
     "SAS_KEY_VALUE_HERE",  # default placeholder in Settings
-    "",
 }
 
 _DEV_EMULATOR_MARKER = "UseDevelopmentEmulator=true"
@@ -447,9 +446,13 @@ def get_message_bus(settings: Any = None) -> MessageBus:
         settings = get_settings()
 
     conn_str: str = settings.service_bus_connection_string or ""
-    is_placeholder = any(marker in conn_str for marker in _FAKE_CONN_STRINGS)
-    # If it has "UseDevelopmentEmulator=true" but also "SAS_KEY_VALUE_HERE" it's
-    # still the default unset placeholder — keep the is_placeholder logic above.
+    # An unset/empty string means "no real bus"; otherwise a connection string is
+    # a placeholder only when it carries one of the known default markers. Empty
+    # is handled by falsiness here — never via substring matching, because the
+    # empty string is a substring of every connection string.
+    is_placeholder = not conn_str.strip() or any(
+        marker in conn_str for marker in _FAKE_CONN_STRINGS
+    )
 
     if is_placeholder:
         return InMemoryBus()

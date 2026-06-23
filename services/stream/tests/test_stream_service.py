@@ -39,6 +39,23 @@ class FailingIndicatorStore(InMemoryTimeSeriesStore):
         await super().ingest(rows)
 
 
+class FlakyReceiveBus(InMemoryBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 0
+
+    async def receive(
+        self,
+        topic: str,
+        subscription: str,
+        max_messages: int = 10,
+    ):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ConnectionError("service bus not ready")
+        return await super().receive(topic, subscription, max_messages=max_messages)
+
+
 def _market_message(
     *,
     symbol: str,
@@ -118,6 +135,13 @@ async def test_service_ingests_druid_rows_caches_snapshot_and_publishes_signal()
     assert snapshot["price"] == 140.0
     assert snapshot["trend"] == "uptrend"
     assert snapshot["anomaly"] is True
+
+    cached_history = await cache.get("history:BTCUSDT")
+    assert isinstance(cached_history, list)
+    assert len(cached_history) == 6
+    assert cached_history[-1]["symbol"] == "BTCUSDT"
+    assert cached_history[-1]["price"] == 140.0
+    assert "_table" not in cached_history[-1]
 
     signal_messages = await bus.peek(TOPIC_SIGNALS, "observer", n=10)
     assert len(signal_messages) == 6
@@ -289,3 +313,41 @@ def test_app_lifespan_starts_background_poller() -> None:
             asyncio.run(asyncio.sleep(0.01))
 
     assert len(signals) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_forever_retries_after_transient_poll_failure() -> None:
+    bus = FlakyReceiveBus()
+    cache = InMemoryCache()
+    store = InMemoryTimeSeriesStore()
+    await bus.receive(TOPIC_MARKET_RAW, STREAM_SUBSCRIPTION, max_messages=0)
+    await bus.receive(TOPIC_SIGNALS, "observer", max_messages=0)
+    bus.failures_remaining = 1
+    body, message_id = _market_message(
+        symbol="BTCUSDT",
+        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        price=42000.0,
+        message_id="btc-retry",
+    )
+    await bus.publish(TOPIC_MARKET_RAW, body, message_id=message_id)
+
+    service = StreamService(bus=bus, cache=cache, store=store)
+    worker = asyncio.create_task(
+        service.run_forever(poll_interval_seconds=0.01, max_messages=1)
+    )
+    try:
+        for _ in range(50):
+            if service.metrics.messages_processed:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    assert service.metrics.messages_processed == 1
+    assert (
+        service.metrics.last_error
+        == "stream polling failed: ConnectionError: service bus not ready"
+    )
+    assert await cache.get_snapshot("BTCUSDT") is not None

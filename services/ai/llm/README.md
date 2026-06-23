@@ -97,6 +97,10 @@ asyncio.run(main())
 - `openai` is optional and imported lazily only when `OpenAIProvider` builds a real client.
   The same client reaches any OpenAI-compatible endpoint (OpenAI, Azure OpenAI, Anthropic,
   OpenRouter, local servers) via `OPENAI_BASE_URL`.
+- OpenAI-compatible embedding responses are coerced to the requested RAG dimension so local
+  servers that ignore the `dimensions` parameter still fit the configured vector index.
+- JSON generation is preferred, but non-JSON local model responses are converted into a
+  conservative structured result using retrieved-context citations.
 
 Heavy/optional SDKs stay import-guarded so `task test` runs with the lightweight dependency set.
 

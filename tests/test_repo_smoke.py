@@ -45,6 +45,7 @@ def test_taskfile_exists():
     content = taskfile_path.read_text(encoding="utf-8")
     assert "smoke:sb" in content
     assert "smoke:ws" in content
+    assert "seed:market" in content
 
 
 def test_claude_md_exists_and_has_disclaimer():

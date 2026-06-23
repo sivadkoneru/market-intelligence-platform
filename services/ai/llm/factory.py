@@ -33,18 +33,11 @@ def _resolved_settings(settings: Settings | None) -> Settings:
 
 def _build_openai(settings: Settings, client: Any | None) -> OpenAIProvider:
     return OpenAIProvider(
-        api_key=settings.openai_api_key,
+        api_key=settings.openai_api_key or "local",
         base_url=settings.openai_base_url,
         chat_model=settings.openai_chat_model,
         embedding_model=settings.openai_embedding_model,
         client=client,
-    )
-
-
-def _missing_api_key() -> RuntimeError:
-    return RuntimeError(
-        "No LLM provider configured. Set OPENAI_API_KEY (any OpenAI-compatible endpoint "
-        "via OPENAI_BASE_URL), or set MOCK_LLM=1 for offline mode."
     )
 
 
@@ -58,9 +51,7 @@ def get_llm_provider(
     resolved = _resolved_settings(settings)
     if resolved.mock_llm:
         return MockLLMProvider()
-    if resolved.openai_api_key:
-        return _build_openai(resolved, openai_client)
-    raise _missing_api_key()
+    return _build_openai(resolved, openai_client)
 
 
 def get_embedding_provider(
@@ -73,9 +64,7 @@ def get_embedding_provider(
     resolved = _resolved_settings(settings)
     if resolved.mock_llm:
         return MockLLMProvider()
-    if resolved.openai_api_key:
-        return _build_openai(resolved, openai_client)
-    raise _missing_api_key()
+    return _build_openai(resolved, openai_client)
 
 
 def get_provider_bundle(

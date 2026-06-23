@@ -101,15 +101,6 @@ def test_factory_keeps_mock_when_mock_llm_set_even_with_key() -> None:
     assert isinstance(get_llm_provider(settings), MockLLMProvider)
     assert isinstance(get_embedding_provider(settings), MockLLMProvider)
 
-
-def test_factory_raises_when_live_without_api_key() -> None:
-    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
-        get_llm_provider(Settings(mock_llm=False))
-
-    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
-        get_embedding_provider(Settings(mock_llm=False))
-
-
 def test_factory_injects_configured_model_names() -> None:
     provider = get_llm_provider(
         Settings(
@@ -191,6 +182,40 @@ class _FakeOpenAIClient:
         }
 
 
+class _DimensionIgnoringOpenAIClient(_FakeOpenAIClient):
+    async def _embedding_create(self, **kwargs: object) -> object:
+        self.embedding_calls.append(dict(kwargs))
+        return {
+            "data": [
+                {"embedding": [0.1, 0.2, 0.3, 0.4]},
+                {"embedding": [0.5]},
+            ]
+        }
+
+
+class _TextOnlyOpenAIClient(_FakeOpenAIClient):
+    async def _chat_create(self, **kwargs: object) -> object:
+        self.chat_calls.append(dict(kwargs))
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "BTC sentiment looks constructive because ETF flow context "
+                            "supports stronger demand."
+                        )
+                    }
+                }
+            ]
+        }
+
+
+class _EmptyOpenAIClient(_FakeOpenAIClient):
+    async def _chat_create(self, **kwargs: object) -> object:
+        self.chat_calls.append(dict(kwargs))
+        return {"choices": [{"message": {"content": ""}}]}
+
+
 @pytest.mark.asyncio
 async def test_openai_provider_parses_fake_chat_and_embeddings() -> None:
     fake_client = _FakeOpenAIClient()
@@ -217,6 +242,65 @@ async def test_openai_provider_parses_fake_chat_and_embeddings() -> None:
     assert fake_client.embedding_calls[0]["model"] == "embed-test"
     assert fake_client.embedding_calls[0]["dimensions"] == 3
     assert isinstance(fake_client.chat_calls[0]["messages"], list)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_coerces_embedding_dimensions() -> None:
+    fake_client = _DimensionIgnoringOpenAIClient()
+    provider = OpenAIProvider(
+        api_key="key",
+        base_url="https://api.openai.com/v1",
+        chat_model="gpt-test",
+        embedding_model="embed-test",
+        client=fake_client,
+    )
+
+    embeddings = await provider.embed(EmbeddingRequest(texts=("a", "b"), dimensions=3))
+
+    assert embeddings.dimensions == 3
+    assert embeddings.vectors == ((0.1, 0.2, 0.3), (0.5, 0.0, 0.0))
+    assert fake_client.embedding_calls[0]["dimensions"] == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_falls_back_for_non_json_chat_response() -> None:
+    fake_client = _TextOnlyOpenAIClient()
+    provider = OpenAIProvider(
+        api_key="key",
+        base_url="https://api.openai.com/v1",
+        chat_model="gpt-test",
+        embedding_model="embed-test",
+        client=fake_client,
+    )
+
+    result = await provider.generate(_request())
+
+    assert result.provider == "openai"
+    assert result.model == "gpt-test"
+    assert result.sentiment_label == "positive"
+    assert result.citations == ("https://example.test/btc-1", "https://example.test/btc-2")
+    assert result.grounded is True
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_fallback_summarizes_empty_chat_from_context() -> None:
+    fake_client = _EmptyOpenAIClient()
+    provider = OpenAIProvider(
+        api_key="key",
+        base_url="https://api.openai.com/v1",
+        chat_model="gpt-test",
+        embedding_model="embed-test",
+        client=fake_client,
+    )
+
+    result = await provider.generate(_request())
+
+    assert result.provider == "openai"
+    assert "Model response did not include a summary" not in result.summary
+    assert result.summary.startswith("Positive outlook for BTCUSDT")
+    assert "Bitcoin miners reported stronger margins" in result.summary
+    assert "https://example.test/btc-1" in result.explanation
+    assert result.grounded is True
 
 
 def test_guardrails_accept_grounded_output_and_reject_ungrounded_output() -> None:

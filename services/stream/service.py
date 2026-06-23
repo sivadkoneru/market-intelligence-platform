@@ -37,6 +37,8 @@ from services.stream.indicators import (
 
 STREAM_SUBSCRIPTION = "stream"
 IDEMPOTENCY_PREFIX = "stream:processed"
+HISTORY_PREFIX = "history"
+MAX_CACHED_HISTORY_ROWS = 500
 
 
 @dataclass(frozen=True)
@@ -265,7 +267,19 @@ class StreamService:
         max_messages: int = 10,
     ) -> None:
         while True:
-            processed = await self.poll_once(max_messages=max_messages)
+            try:
+                processed = await self.poll_once(max_messages=max_messages)
+            except Exception as exc:
+                self.metrics.last_error = (
+                    f"stream polling failed: {type(exc).__name__}: {exc}"
+                )
+                self._log.warning(
+                    "stream.poll_failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             if processed == 0:
                 await asyncio.sleep(poll_interval_seconds)
 
@@ -308,6 +322,7 @@ class StreamService:
             self.metrics.indicator_rows_ingested += 1
 
             await self._cache.set_snapshot(event.symbol, processed.snapshot)
+            await self._append_cached_history(event.symbol, processed.tick_row)
             await self._bus.publish(
                 self._signal_topic,
                 processed.signal.model_dump(mode="json"),
@@ -343,6 +358,15 @@ class StreamService:
             message_id=message.message_id,
             reason=reason,
         )
+
+    async def _append_cached_history(self, symbol: str, row: dict[str, Any]) -> None:
+        key = f"{HISTORY_PREFIX}:{symbol}"
+        history = await self._cache.get(key)
+        rows = list(history) if isinstance(history, list) else []
+        cached_row = dict(row)
+        cached_row.pop("_table", None)
+        rows.append(cached_row)
+        await self._cache.set(key, rows[-MAX_CACHED_HISTORY_ROWS:])
 
 
 def _trend_score(trend: str | None) -> float | None:

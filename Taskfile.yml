@@ -1,5 +1,12 @@
 version: '3'
 
+# Scripts under scripts/ import the top-level `libs` package. Running them by
+# path (e.g. `python scripts/sb_peek.py`) puts scripts/ on sys.path instead of
+# the repo root, so `import libs` fails. pytest gets this via pyproject's
+# `pythonpath = ["."]`; plain script runs need it here.
+env:
+  PYTHONPATH: "."
+
 tasks:
   default:
     desc: List available tasks
@@ -53,6 +60,12 @@ tasks:
     deps: [setup]
     cmds:
       - .venv/bin/python scripts/sb_peek.py market.raw --messages 3
+
+  seed:market:
+    desc: Publish deterministic sample market.raw events for local API testing
+    deps: [setup]
+    cmds:
+      - .venv/bin/python scripts/seed_market_data.py --events 15
 
   smoke:ws:
     desc: Subscribe to the API websocket and log the first live payload

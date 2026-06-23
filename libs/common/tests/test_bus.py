@@ -1,5 +1,7 @@
 """Tests for libs.common.bus — InMemoryBus, ServiceBusBus settlement, and factory."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from libs.common.bus import (
@@ -10,6 +12,7 @@ from libs.common.bus import (
     _SBMessageRef,
     get_message_bus,
 )
+from libs.common.config import Settings
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -188,7 +191,38 @@ async def test_peek_respects_n():
 
 
 def test_get_message_bus_returns_in_memory_by_default():
-    bus = get_message_bus()
+    # The shipped default config must stay offline-safe. Ignore any developer-local
+    # .env so this asserts the field default, not whatever the machine has set.
+    bus = get_message_bus(Settings(_env_file=None))
+    assert isinstance(bus, InMemoryBus)
+
+
+def test_get_message_bus_returns_servicebus_for_real_connection_string():
+    settings = SimpleNamespace(
+        service_bus_connection_string=(
+            "Endpoint=sb://localhost;SharedAccessKeyName=RootManageSharedAccessKey;"
+            "SharedAccessKey=ABC123;UseDevelopmentEmulator=true"
+        )
+    )
+    bus = get_message_bus(settings)
+    assert isinstance(bus, ServiceBusBus)
+
+
+def test_get_message_bus_returns_in_memory_for_placeholder():
+    settings = SimpleNamespace(
+        service_bus_connection_string=(
+            "Endpoint=sb://localhost;SharedAccessKeyName=RootManageSharedAccessKey;"
+            "SharedAccessKey=SAS_KEY_VALUE_HERE;UseDevelopmentEmulator=true"
+        )
+    )
+    bus = get_message_bus(settings)
+    assert isinstance(bus, InMemoryBus)
+
+
+@pytest.mark.parametrize("conn", ["", "   ", None])
+def test_get_message_bus_returns_in_memory_for_empty(conn):
+    settings = SimpleNamespace(service_bus_connection_string=conn)
+    bus = get_message_bus(settings)
     assert isinstance(bus, InMemoryBus)
 
 

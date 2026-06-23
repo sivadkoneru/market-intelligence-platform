@@ -8,6 +8,7 @@ This platform is a portfolio project only. No financial advice. No real trades.
 - Compose-exposed service: `http://localhost:8000`
 - WebSocket smoke URL: `ws://localhost:8000/ws/stream`
 - Direct WebSocket URL: `ws://localhost:8005/ws/stream`
+- Ingestion service for local mock inputs: `http://localhost:8001`
 
 ## Common Notes
 
@@ -15,6 +16,33 @@ This platform is a portfolio project only. No financial advice. No real trades.
 - Requests and event processing honor `X-Correlation-ID` and `X-Trace-ID` when present.
 - REST timestamps are ISO-8601 strings.
 - The API service resolves to in-memory ports by default when live infra is not configured.
+
+## Local Mock Inputs
+
+### `POST http://localhost:8001/mock/news`
+
+Publishes a valid `NewsEvent` to `news.raw` so the `ai-analysis` service can
+generate an `Insight`.
+
+Minimal request:
+
+```bash
+curl -X POST http://localhost:8001/mock/news
+```
+
+Custom request:
+
+```bash
+curl -X POST http://localhost:8001/mock/news \
+  -H 'Content-Type: application/json' \
+  -d '{"symbols":["BTCUSDT"],"title":"BTC ETF inflows improve","body":"BTC sentiment is constructive in this local mock item."}'
+```
+
+Then read the generated insight from the API service:
+
+```bash
+curl http://localhost:8000/insights/BTCUSDT
+```
 
 ## REST Surface
 
@@ -52,7 +80,10 @@ Plain-text counters and gauges using `# TYPE` metadata for scraper-friendly loca
 
 ### `GET /symbols`
 
-Returns the set of symbols discovered from Druid rows.
+Returns the set of symbols discovered from Druid rows and latest stream
+snapshots cached in Redis. Fresh local runs can therefore show symbols as soon
+as the stream service processes `market.raw`, even before Druid indexing catches
+up.
 
 Response shape:
 
@@ -62,7 +93,8 @@ Response shape:
 
 ### `GET /market/{symbol}/latest`
 
-Returns the latest Druid row for the symbol or `404` if none exists.
+Returns the latest cached market snapshot or latest Druid row for the symbol, or
+`404` if none exists.
 
 ### `GET /market/{symbol}/history?from=...&to=...`
 
@@ -81,6 +113,10 @@ Response shape:
   "rows": []
 }
 ```
+
+Rows are read from Druid and merged with the recent `history:{symbol}` stream
+cache so newly seeded local data is available before Druid batch ingestion
+settles.
 
 Notes:
 

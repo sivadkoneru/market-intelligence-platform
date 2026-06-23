@@ -131,6 +131,47 @@ async def test_query_sql_count():
     assert result[0]["EXPR$0"] == 7
 
 
+@pytest.mark.asyncio
+async def test_query_sql_information_schema_tables():
+    store = InMemoryTimeSeriesStore()
+    await store.ingest([
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 1)},
+        {"_table": "indicators", "symbol": "ETHUSDT", "ts": _ts(2024, 1, 2)},
+    ])
+
+    result = await store.query_sql(
+        """
+        SELECT "TABLE_NAME"
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE "TABLE_SCHEMA" = 'druid'
+        """
+    )
+
+    assert result == [{"TABLE_NAME": "indicators"}, {"TABLE_NAME": "ticks"}]
+
+
+@pytest.mark.asyncio
+async def test_query_sql_distinct_symbols_ignores_empty_values():
+    store = InMemoryTimeSeriesStore()
+    await store.ingest([
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 1)},
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 2)},
+        {"_table": "ticks", "symbol": "ETHUSDT", "ts": _ts(2024, 1, 3)},
+        {"_table": "ticks", "symbol": "", "ts": _ts(2024, 1, 4)},
+        {"_table": "ticks", "ts": _ts(2024, 1, 5)},
+    ])
+
+    result = await store.query_sql(
+        """
+        SELECT DISTINCT "symbol" AS "symbol"
+        FROM "ticks"
+        WHERE "symbol" IS NOT NULL
+        """
+    )
+
+    assert result == [{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"}]
+
+
 # ---------------------------------------------------------------------------
 # DruidClient.query_sql — HTTP error handling (mocked httpx)
 # ---------------------------------------------------------------------------
@@ -240,6 +281,8 @@ def test_build_ingest_specs_splits_mixed_tables_and_strips_table_field():
     assert len(specs) == 2
     by_source = {spec["spec"]["dataSchema"]["dataSource"]: spec for spec in specs}
     assert set(by_source) == {"ticks", "indicators"}
+    assert by_source["ticks"]["spec"]["ioConfig"]["appendToExisting"] is True
+    assert by_source["indicators"]["spec"]["ioConfig"]["appendToExisting"] is True
     assert "_table" not in by_source["ticks"]["spec"]["dataSchema"]["dimensionsSpec"]["dimensions"]
     assert (
         "_table"
@@ -267,6 +310,28 @@ def test_build_ingest_specs_defaults_rows_without_table_to_ticks():
 
 def test_build_ingest_specs_empty_rows_is_noop():
     assert DruidClient._build_ingest_specs([]) == []
+
+
+@pytest.mark.asyncio
+async def test_druid_latest_uses_quoted_druid_time_query():
+    class RecordingDruidClient(DruidClient):
+        def __init__(self) -> None:
+            super().__init__("http://druid.test")
+            self.sql: str | None = None
+
+        async def query_sql(self, sql: str):
+            self.sql = sql
+            return []
+
+    client = RecordingDruidClient()
+
+    assert await client.latest("BTC'USDT") is None
+
+    assert client.sql == (
+        'SELECT * FROM "ticks" '
+        'WHERE "symbol" = \'BTC\'\'USDT\' '
+        'ORDER BY "__time" DESC LIMIT 1'
+    )
 
 
 # ---------------------------------------------------------------------------

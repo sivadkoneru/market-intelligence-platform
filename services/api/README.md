@@ -8,7 +8,7 @@ Portfolio project only. No financial advice and no real trades.
 ## Purpose
 
 - Expose `GET /health` and `GET /metrics`
-- List tracked symbols with `GET /symbols`
+- List tracked symbols with `GET /symbols` from Druid rows plus stream cache snapshots
 - Serve latest market snapshots and historical market rows
 - Serve latest indicators per symbol from the stream cache and time-series store
 - Surface latest `signals`, `alerts`, and `insights`
@@ -58,7 +58,8 @@ await service.prime_subscriptions()
 
 ## Notes
 
-- Market history uses the time-series store directly.
+- Market history reads the time-series store and merges recent `history:{symbol}`
+  rows from the cache.
 - Indicator reads prefer the latest Redis-style snapshot and fall back to `indicators`
   rows from the time-series store.
 - Insights are served from the cached `insight:{symbol}` payload first, then from the

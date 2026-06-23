@@ -15,9 +15,10 @@ def test_ai_requirements_are_pinned() -> None:
     assert all("==" in line for line in lines)
     assert "fastapi==0.115.6" in lines
     assert "newrelic==13.1.1" in lines
-    assert "azure-servicebus==7.12.3" in lines
+    assert "azure-servicebus==7.14.3" in lines
     assert "elasticsearch==8.17.0" in lines
     assert "tenacity==9.0.0" in lines
+    assert "openai==1.59.6" in lines
 
 
 def test_ai_dockerfile_uses_runtime_pattern() -> None:
