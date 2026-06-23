@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -61,6 +62,16 @@ class CloseRecordingCache(InMemoryCache):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class SymbolQueryRecordingStore(InMemoryTimeSeriesStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.queries: list[str] = []
+
+    async def query_sql(self, sql: str) -> list[dict[str, Any]]:
+        self.queries.append(" ".join(sql.strip().split()))
+        return await super().query_sql(sql)
 
 
 def _seed_store(store: InMemoryTimeSeriesStore) -> None:
@@ -313,6 +324,76 @@ def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
     assert "api_symbols_requests 1" in metrics_after.text
     assert "api_market_latest_requests 1" in metrics_after.text
     assert "api_http_requests_total 2" in metrics_after.text
+
+
+def test_symbols_query_uses_only_known_druid_datasources() -> None:
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = SymbolQueryRecordingStore()
+    _seed_store(store)
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get("/symbols")
+
+    assert response.status_code == 200
+    assert response.json() == {"symbols": ["BTCUSDT", "ETHUSDT"], "count": 2}
+    assert len(store.queries) == 3
+    assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
+    assert 'FROM "ticks"' in store.queries[1]
+    assert 'FROM "indicators"' in store.queries[2]
+
+
+def test_symbols_skips_missing_indicator_datasource() -> None:
+    import asyncio
+
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = SymbolQueryRecordingStore()
+    asyncio.run(store.ingest([
+        {"_table": "ticks", "symbol": "SOLUSDT", "ts": "2026-01-01T00:00:00Z"},
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": "2026-01-01T00:01:00Z"},
+    ]))
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get("/symbols")
+
+    assert response.status_code == 200
+    assert response.json() == {"symbols": ["BTCUSDT", "SOLUSDT"], "count": 2}
+    assert len(store.queries) == 2
+    assert 'FROM "ticks"' in store.queries[1]
+    assert all('FROM "indicators"' not in query for query in store.queries[1:])
+
+
+def test_symbols_returns_empty_when_druid_datasources_are_absent() -> None:
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = SymbolQueryRecordingStore()
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get("/symbols")
+
+    assert response.status_code == 200
+    assert response.json() == {"symbols": [], "count": 0}
+    assert len(store.queries) == 1
+    assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
+
+
+def test_symbols_include_cached_snapshots_when_druid_datasources_are_absent() -> None:
+    import asyncio
+
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = SymbolQueryRecordingStore()
+    asyncio.run(cache.set_snapshot("ADAUSDT", {"price": 1.25}))
+    asyncio.run(cache.set_snapshot("BTCUSDT", {"price": 100000.0}))
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get("/symbols")
+
+    assert response.status_code == 200
+    assert response.json() == {"symbols": ["ADAUSDT", "BTCUSDT"], "count": 2}
+    assert len(store.queries) == 1
+    assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
 
 
 def test_indicators_fall_back_to_timeseries_when_cache_is_empty() -> None:

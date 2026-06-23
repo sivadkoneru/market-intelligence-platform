@@ -335,12 +335,39 @@ class APIService:
     async def list_symbols(self) -> list[str]:
         self.metrics.symbols_requests += 1
         self.metrics.requests_total += 1
-        rows = await self._rows_for_tables(("ticks", "indicators"))
+        candidate_tables = ("ticks", "indicators")
+        table_rows = await self._store.query_sql(
+            """
+            SELECT "TABLE_NAME"
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE "TABLE_SCHEMA" = 'druid'
+              AND "TABLE_NAME" IN ('ticks', 'indicators')
+            """
+        )
+        known_tables = {
+            str(row["TABLE_NAME"])
+            for row in table_rows
+            if row.get("TABLE_NAME")
+        }
+        rows: list[dict[str, Any]] = []
+        for table in candidate_tables:
+            if table not in known_tables:
+                continue
+            rows.extend(
+                await self._store.query_sql(
+                    f"""
+                    SELECT DISTINCT "symbol" AS "symbol"
+                    FROM "{table}"
+                    WHERE "symbol" IS NOT NULL
+                    """
+                )
+            )
         symbols = {
             str(row["symbol"])
             for row in rows
             if row.get("symbol")
         }
+        symbols.update(await self._cache.list_snapshot_symbols())
         return sorted(symbols)
 
     async def latest_market(self, symbol: str) -> dict[str, Any] | None:

@@ -7,10 +7,22 @@ Sensitive/optional fields (LLM keys, New Relic) default to None.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Optional
 
 from pydantic_settings import BaseSettings
+
+
+def _dotenv_path() -> Optional[str]:
+    """
+    Resolve the dotenv file the settings load from.
+
+    Defaults to the repo-root ``.env``. ``MIP_DOTENV_PATH`` overrides the path;
+    setting it to an empty string disables dotenv loading entirely, which the
+    test gate uses to stay hermetic against a developer-local ``.env``.
+    """
+    return os.environ.get("MIP_DOTENV_PATH", ".env") or None
 
 
 class Settings(BaseSettings):
@@ -57,7 +69,7 @@ class Settings(BaseSettings):
     service_name: str = "market-intel"
 
     model_config = {
-        "env_file": ".env",
+        "env_file": _dotenv_path(),
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
         "extra": "ignore",

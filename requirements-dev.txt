@@ -13,7 +13,7 @@ structlog==24.4.0
 tenacity==9.0.0
 redis==5.2.1
 elasticsearch==8.17.0
-azure-servicebus==7.12.3
+azure-servicebus==7.14.3
 sqlalchemy==2.0.36
 asyncpg==0.30.0
 python-dateutil==2.9.0.post0

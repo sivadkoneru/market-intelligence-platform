@@ -2,6 +2,26 @@
 
 import os
 
+import libs.common.config as cfg
+
+
+def test_dotenv_path_defaults_to_repo_env(monkeypatch):
+    """With no override, settings load from the repo-root .env."""
+    monkeypatch.delenv("MIP_DOTENV_PATH", raising=False)
+    assert cfg._dotenv_path() == ".env"
+
+
+def test_dotenv_path_can_be_disabled(monkeypatch):
+    """An empty MIP_DOTENV_PATH disables dotenv loading (hermetic test gate)."""
+    monkeypatch.setenv("MIP_DOTENV_PATH", "")
+    assert cfg._dotenv_path() is None
+
+
+def test_dotenv_path_can_point_at_a_custom_file(monkeypatch):
+    """A non-empty MIP_DOTENV_PATH overrides which env file is read."""
+    monkeypatch.setenv("MIP_DOTENV_PATH", "/tmp/custom.env")
+    assert cfg._dotenv_path() == "/tmp/custom.env"
+
 
 def test_settings_defaults_offline():
     """Settings() must not fail with no env vars set."""

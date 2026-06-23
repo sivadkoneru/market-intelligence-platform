@@ -131,6 +131,47 @@ async def test_query_sql_count():
     assert result[0]["EXPR$0"] == 7
 
 
+@pytest.mark.asyncio
+async def test_query_sql_information_schema_tables():
+    store = InMemoryTimeSeriesStore()
+    await store.ingest([
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 1)},
+        {"_table": "indicators", "symbol": "ETHUSDT", "ts": _ts(2024, 1, 2)},
+    ])
+
+    result = await store.query_sql(
+        """
+        SELECT "TABLE_NAME"
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE "TABLE_SCHEMA" = 'druid'
+        """
+    )
+
+    assert result == [{"TABLE_NAME": "indicators"}, {"TABLE_NAME": "ticks"}]
+
+
+@pytest.mark.asyncio
+async def test_query_sql_distinct_symbols_ignores_empty_values():
+    store = InMemoryTimeSeriesStore()
+    await store.ingest([
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 1)},
+        {"_table": "ticks", "symbol": "BTCUSDT", "ts": _ts(2024, 1, 2)},
+        {"_table": "ticks", "symbol": "ETHUSDT", "ts": _ts(2024, 1, 3)},
+        {"_table": "ticks", "symbol": "", "ts": _ts(2024, 1, 4)},
+        {"_table": "ticks", "ts": _ts(2024, 1, 5)},
+    ])
+
+    result = await store.query_sql(
+        """
+        SELECT DISTINCT "symbol" AS "symbol"
+        FROM "ticks"
+        WHERE "symbol" IS NOT NULL
+        """
+    )
+
+    assert result == [{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"}]
+
+
 # ---------------------------------------------------------------------------
 # DruidClient.query_sql — HTTP error handling (mocked httpx)
 # ---------------------------------------------------------------------------

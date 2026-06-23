@@ -1,5 +1,12 @@
 version: '3'
 
+# Scripts under scripts/ import the top-level `libs` package. Running them by
+# path (e.g. `python scripts/sb_peek.py`) puts scripts/ on sys.path instead of
+# the repo root, so `import libs` fails. pytest gets this via pyproject's
+# `pythonpath = ["."]`; plain script runs need it here.
+env:
+  PYTHONPATH: "."
+
 tasks:
   default:
     desc: List available tasks

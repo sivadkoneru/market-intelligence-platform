@@ -52,7 +52,10 @@ Plain-text counters and gauges using `# TYPE` metadata for scraper-friendly loca
 
 ### `GET /symbols`
 
-Returns the set of symbols discovered from Druid rows.
+Returns the set of symbols discovered from Druid rows and latest stream
+snapshots cached in Redis. Fresh local runs can therefore show symbols as soon
+as the stream service processes `market.raw`, even before Druid indexing catches
+up.
 
 Response shape:
 

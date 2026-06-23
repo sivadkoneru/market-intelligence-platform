@@ -32,8 +32,6 @@ task smoke:ws
 - [Azure production notes](docs/AZURE_PRODUCTION.md)
 - [API service README](services/api/README.md)
 
-See `CLAUDE.md` for the full codebase guide, architecture conventions, and commit rules.
-
 ## Layout
 
 ```

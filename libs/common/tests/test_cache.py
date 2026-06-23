@@ -106,6 +106,27 @@ async def test_snapshot_missing_returns_none():
     assert await cache.get_snapshot("MISSING") is None
 
 
+@pytest.mark.asyncio
+async def test_list_snapshot_symbols_returns_sorted_snapshot_keys():
+    cache = InMemoryCache()
+    await cache.set_snapshot("ETHUSDT", {"price": 3000})
+    await cache.set_snapshot("BTCUSDT", {"price": 100000})
+    await cache.set("regular-key", {"symbol": "IGNORED"})
+
+    assert await cache.list_snapshot_symbols() == ["BTCUSDT", "ETHUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_list_snapshot_symbols_ignores_expired_snapshots():
+    now = [0.0]
+    cache = InMemoryCache(time_fn=lambda: now[0])
+    await cache.set("snapshot:BTCUSDT", {"price": 100000}, ttl=10)
+    await cache.set_snapshot("ETHUSDT", {"price": 3000})
+    now[0] = 10.1
+
+    assert await cache.list_snapshot_symbols() == ["ETHUSDT"]
+
+
 # ---------------------------------------------------------------------------
 # seen() — idempotency
 # ---------------------------------------------------------------------------
