@@ -111,9 +111,9 @@ def test_log_level_field_present(capsys):
 
 def test_no_bare_print():
     """The logging module itself must not use bare print calls."""
-    src = pathlib.Path(
-        "/Users/sivakoneru/Development/market-intelligence-platform/libs/common/logging.py"
-    ).read_text()
+    src = (pathlib.Path(__file__).parents[1] / "logging.py").read_text(
+        encoding="utf-8"
+    )
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
