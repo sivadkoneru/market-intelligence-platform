@@ -154,3 +154,62 @@ def test_redis_url_default():
     finally:
         if saved:
             os.environ["REDIS_URL"] = saved
+
+
+# ---------------------------------------------------------------------------
+# resolve_settings / is_default — shared by every port factory
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_settings_returns_the_injected_object():
+    injected = cfg.Settings(redis_url="redis://injected:6379/0")
+
+    assert cfg.resolve_settings(injected) is injected
+
+
+def test_resolve_settings_falls_back_to_the_cached_singleton():
+    assert cfg.resolve_settings(None) is cfg.get_settings()
+
+
+def test_is_default_recognises_the_shipped_placeholder():
+    assert cfg.is_default("redis_url", cfg.Settings.model_fields["redis_url"].default)
+    assert cfg.is_default("druid_url", "http://localhost:8888")
+    assert cfg.is_default("elasticsearch_url", "http://localhost:9200")
+
+
+def test_is_default_rejects_a_configured_value():
+    assert not cfg.is_default("redis_url", "redis://prod-cache:6379/0")
+    assert not cfg.is_default("druid_url", "http://druid-router:8888")
+
+
+def test_is_default_tracks_the_declared_default_rather_than_a_copy():
+    """
+    The factories decide fake-vs-real from this.
+
+    Hard-coding the placeholder at each call site meant changing a default here
+    silently flipped a factory into building a real client against an address
+    nobody had configured, so the check reads the field's declared default.
+    """
+    for field_name in ("redis_url", "druid_url", "elasticsearch_url"):
+        declared = cfg.Settings.model_fields[field_name].default
+        assert cfg.is_default(field_name, declared)
+
+
+def test_factories_return_fakes_for_every_shipped_default():
+    """Offline defaults must never construct a networked client."""
+    from libs.common.bus import InMemoryBus
+    from libs.common.druid import InMemoryTimeSeriesStore
+    from libs.common.es import InMemorySearchStore
+    from libs.common.redis_client import InMemoryCache
+
+    settings = cfg.Settings()
+
+    from libs.common.bus import get_message_bus
+    from libs.common.druid import get_timeseries_store
+    from libs.common.es import get_search_store
+    from libs.common.redis_client import get_cache
+
+    assert isinstance(get_cache(settings), InMemoryCache)
+    assert isinstance(get_timeseries_store(settings), InMemoryTimeSeriesStore)
+    assert isinstance(get_search_store(settings), InMemorySearchStore)
+    assert isinstance(get_message_bus(settings), InMemoryBus)

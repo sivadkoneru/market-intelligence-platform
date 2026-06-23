@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -106,7 +106,7 @@ def _signal_body(
 ) -> dict[str, Any]:
     return {
         "event_id": event_id,
-        "ts": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+        "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
         "symbol": symbol,
         "source": "stream",
         "indicators": {
@@ -128,7 +128,7 @@ def _insight_body(
 ) -> dict[str, Any]:
     return {
         "event_id": event_id,
-        "ts": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+        "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
         "symbol": symbol,
         "sentiment_score": sentiment_score,
         "sentiment_label": "positive" if sentiment_score > 0 else "negative",
@@ -202,14 +202,15 @@ async def test_service_dead_letters_invalid_payloads() -> None:
     assert len(dlq_messages) == 1
     assert dlq_messages[0].body["event_id"] == "bad-insight"
     assert service.metrics.dead_lettered == 1
+    assert service.metrics.last_error is not None
     assert "invalid insight payload" in service.metrics.last_error
     assert await cache.get(alert_processed_key(TOPIC_INSIGHTS, "bad-insight")) is None
 
 
 @pytest.mark.asyncio
 async def test_service_retries_transient_alert_publish_failures() -> None:
-    bus = FailingAlertBus(failures_before_success=2)
-    service, bus, cache = await _build_service(bus, max_processing_attempts=3)
+    failing_bus = FailingAlertBus(failures_before_success=2)
+    service, bus, cache = await _build_service(failing_bus, max_processing_attempts=3)
     await bus.publish(TOPIC_INSIGHTS, _insight_body(event_id="ins-retry"))
 
     await service.poll_once(max_messages=1)
@@ -218,14 +219,14 @@ async def test_service_retries_transient_alert_publish_failures() -> None:
     assert len(alerts) == 1
     assert service.metrics.processing_retries == 2
     assert service.metrics.dead_lettered == 0
-    assert bus.alert_publish_attempts == 3
+    assert failing_bus.alert_publish_attempts == 3
     assert await cache.get(alert_processed_key(TOPIC_INSIGHTS, "ins-retry")) is True
 
 
 @pytest.mark.asyncio
 async def test_partial_publish_retry_skips_already_published_alerts() -> None:
-    bus = FailingOnSecondAlertBus()
-    service, bus, cache = await _build_service(bus, max_processing_attempts=3)
+    failing_bus = FailingOnSecondAlertBus()
+    service, bus, cache = await _build_service(failing_bus, max_processing_attempts=3)
     await bus.publish(
         TOPIC_SIGNALS,
         _signal_body(event_id="sig-partial", anomaly=True, rsi=80.0, volatility=0.08),
@@ -234,7 +235,7 @@ async def test_partial_publish_retry_skips_already_published_alerts() -> None:
     await service.poll_once(max_messages=1)
     alerts = await bus.peek(TOPIC_ALERTS, "observer", n=10)
 
-    assert bus.alert_publish_attempts == 4
+    assert failing_bus.alert_publish_attempts == 4
     assert len(alerts) == 3
     assert [alert.body["rule"] for alert in alerts] == [
         "anomaly_flag",
@@ -250,9 +251,9 @@ async def test_partial_publish_retry_skips_already_published_alerts() -> None:
 @pytest.mark.asyncio
 async def test_circuit_breaker_opens_after_repeated_failures() -> None:
     breaker = CircuitBreaker(failure_threshold=2, reset_timeout=60.0)
-    bus = FailingAlertBus(failures_before_success=0, fail_forever=True)
+    failing_bus = FailingAlertBus(failures_before_success=0, fail_forever=True)
     service, bus, cache = await _build_service(
-        bus,
+        failing_bus,
         max_processing_attempts=1,
         circuit_breaker=breaker,
     )
@@ -268,11 +269,12 @@ async def test_circuit_breaker_opens_after_repeated_failures() -> None:
     assert len(dlq_messages) == 3
     assert service.metrics.dead_lettered == 3
     assert service.metrics.circuit_open_rejections == 1
-    assert bus.alert_publish_attempts == 2
+    assert failing_bus.alert_publish_attempts == 2
     assert await cache.get(alert_processed_key(TOPIC_INSIGHTS, "ins-fail-1")) is None
     assert await cache.get(alert_processed_key(TOPIC_INSIGHTS, "ins-fail-2")) is None
     assert await cache.get(alert_processed_key(TOPIC_INSIGHTS, "ins-fail-3")) is None
     assert await cache.get(alert_lock_key(TOPIC_INSIGHTS, "ins-fail-1")) is None
+    assert service.metrics.last_error is not None
     assert "open circuit" in service.metrics.last_error
 
 

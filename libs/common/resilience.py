@@ -7,9 +7,13 @@ in these helpers as per platform conventions.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import functools
 import time as _time
-from typing import Any, Callable, Coroutine, TypeVar
+from collections.abc import Callable, Coroutine, Iterable
+from inspect import isawaitable
+from typing import Any, Protocol, TypeVar
 
 from tenacity import (
     AsyncRetrying,
@@ -24,6 +28,9 @@ __all__ = [
     "CircuitBreaker",
     "retry_async",
     "with_retry",
+    "run_poll_loop",
+    "dead_letter_message",
+    "close_backends",
 ]
 
 T = TypeVar("T")
@@ -176,17 +183,131 @@ def with_retry(
     def decorator(
         fn: Callable[..., Coroutine[Any, Any, T]],
     ) -> Callable[..., Coroutine[Any, Any, T]]:
+        @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             return await retry_async(
-                fn, *args,
+                fn,
+                *args,
                 max_attempts=max_attempts,
                 wait_min=wait_min,
                 wait_max=wait_max,
                 **kwargs,
             )
 
-        wrapper.__name__ = fn.__name__
-        wrapper.__doc__ = fn.__doc__
-        return wrapper  # type: ignore[return-value]
+        return wrapper
 
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# Consumer poll loop
+# ---------------------------------------------------------------------------
+
+
+class _LoopMetrics(Protocol):
+    last_error: str | None
+
+
+async def run_poll_loop(
+    poll_once: Callable[..., Coroutine[Any, Any, int]],
+    *,
+    service_name: str,
+    log: Any,
+    metrics: _LoopMetrics,
+    poll_interval_seconds: float = 0.25,
+    max_messages: int = 10,
+) -> None:
+    """
+    Drive ``poll_once`` forever, surviving transient failures.
+
+    Every service consumer runs this same loop, and a consumer that dies on the
+    first Service Bus or Redis blip fails invisibly: the background task ends
+    while ``/health`` keeps reporting ``ok`` and no messages flow. Errors are
+    recorded on ``metrics.last_error``, logged, and retried after a pause.
+
+    Returning to the caller only happens via cancellation.
+    """
+    while True:
+        try:
+            processed = await poll_once(max_messages=max_messages)
+        except Exception as exc:
+            metrics.last_error = f"{service_name} polling failed: {type(exc).__name__}: {exc}"
+            log.warning(
+                f"{service_name}.poll_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            await asyncio.sleep(poll_interval_seconds)
+            continue
+        if processed == 0:
+            await asyncio.sleep(poll_interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Consumer shutdown / dead-letter helpers
+# ---------------------------------------------------------------------------
+
+
+class _DeadLetterMetrics(Protocol):
+    dead_lettered: int
+    last_error: str | None
+
+
+async def dead_letter_message(
+    message: Any,
+    reason: str,
+    *,
+    bus: Any,
+    log: Any,
+    metrics: _DeadLetterMetrics,
+    service_name: str,
+) -> None:
+    """
+    Dead-letter *message*, recording the reason on ``metrics`` and in the log.
+
+    Each consumer had its own copy of this three-step sequence (count, remember
+    the reason, hand the message to the broker) and dropping any one step is
+    silent: a message vanishes with no counter and no log line. The service name
+    only selects the log event, so ``stream.dead_lettered`` and
+    ``alerting.dead_lettered`` stay distinguishable in the log stream.
+    """
+    metrics.dead_lettered += 1
+    metrics.last_error = reason
+    await bus.dead_letter(message, reason=reason)
+    log.warning(
+        f"{service_name}.dead_lettered",
+        topic=message.topic,
+        subscription=message.subscription,
+        message_id=message.message_id,
+        reason=reason,
+    )
+
+
+async def close_backends(
+    backends: Iterable[Any],
+    *,
+    log: Any,
+    service_name: str,
+) -> None:
+    """
+    Close every backend that exposes ``close()``, even if one of them fails.
+
+    A plain loop strands every backend after the first one that raises, leaking
+    AMQP links and Redis sockets on each crash-loop restart. Failures are logged
+    per backend rather than raised, so one unreachable service cannot block the
+    shutdown of the others.
+    """
+    for backend in backends:
+        close = getattr(backend, "close", None)
+        if close is None:
+            continue
+        try:
+            result = close()
+            if isawaitable(result):
+                await result
+        except Exception as exc:
+            log.warning(
+                f"{service_name}.backend_close_failed",
+                backend=type(backend).__name__,
+                error=str(exc),
+            )

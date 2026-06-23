@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from libs.common import TOPIC_NEWS_RAW, MessageBus, get_logger
+from libs.common import TOPIC_NEWS_RAW, MessageBus, get_logger, render_counters
 from services.ingestion.sources.base import NewsCollector, hash_news_event
 
 
@@ -23,18 +23,16 @@ class NewsPollingMetrics:
     published_message_ids: set[str] = field(default_factory=set)
 
     def render(self) -> str:
-        lines = [
-            "# TYPE news_polling_collectors_polled counter",
-            f"news_polling_collectors_polled {self.collectors_polled}",
-            "# TYPE news_polling_events_seen counter",
-            f"news_polling_events_seen {self.events_seen}",
-            "# TYPE news_polling_publish_attempts counter",
-            f"news_polling_publish_attempts {self.publish_attempts}",
-            "# TYPE news_polling_unique_publishes counter",
-            f"news_polling_unique_publishes {self.unique_publishes}",
-            "# TYPE news_polling_duplicate_events counter",
-            f"news_polling_duplicate_events {self.duplicate_events}",
-        ]
+        lines = render_counters(
+            "news_polling",
+            {
+                "collectors_polled": self.collectors_polled,
+                "events_seen": self.events_seen,
+                "publish_attempts": self.publish_attempts,
+                "unique_publishes": self.unique_publishes,
+                "duplicate_events": self.duplicate_events,
+            },
+        )
         return "\n".join(lines) + "\n"
 
 
@@ -104,4 +102,3 @@ class NewsPollingService:
             "collectors": len(self._collectors),
             "events_seen": self.metrics.events_seen,
         }
-

@@ -12,11 +12,13 @@ from typing import Any
 from libs.common import (
     TOPIC_MARKET_RAW,
     TOPIC_NEWS_RAW,
-    HTTPMetrics,
     MessageBus,
     NewsEvent,
+    WorkerMetrics,
+    close_backends,
     get_logger,
     market_event_key,
+    render_counters,
 )
 from services.ingestion.normalizer import normalize_market_payload
 from services.ingestion.replay import DeterministicReplayFeed, ReplayDisconnectError
@@ -25,7 +27,7 @@ ReplayFeedFactory = Callable[[], DeterministicReplayFeed]
 
 
 @dataclass
-class IngestionMetrics:
+class IngestionMetrics(WorkerMetrics):
     events_seen: int = 0
     events_normalized: int = 0
     publish_attempts: int = 0
@@ -34,48 +36,22 @@ class IngestionMetrics:
     duplicate_events: int = 0
     reconnects: int = 0
     disconnects: int = 0
-    last_error: str | None = None
-    http: HTTPMetrics = field(default_factory=HTTPMetrics)
     published_message_ids: set[str] = field(default_factory=set)
 
-    def record_http_request(
-        self,
-        *,
-        method: str,
-        path: str,
-        status_code: int,
-        duration_ms: float,
-        trace_context_provided: bool,
-        correlation_context_provided: bool,
-    ) -> None:
-        self.http.record_http_request(
-            method=method,
-            path=path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-            trace_context_provided=trace_context_provided,
-            correlation_context_provided=correlation_context_provided,
-        )
-
     def render(self) -> str:
-        lines = [
-            "# TYPE ingestion_events_seen counter",
-            f"ingestion_events_seen {self.events_seen}",
-            "# TYPE ingestion_events_normalized counter",
-            f"ingestion_events_normalized {self.events_normalized}",
-            "# TYPE ingestion_publish_attempts counter",
-            f"ingestion_publish_attempts {self.publish_attempts}",
-            "# TYPE ingestion_unique_publishes counter",
-            f"ingestion_unique_publishes {self.unique_publishes}",
-            "# TYPE ingestion_news_publishes counter",
-            f"ingestion_news_publishes {self.news_publishes}",
-            "# TYPE ingestion_duplicate_events counter",
-            f"ingestion_duplicate_events {self.duplicate_events}",
-            "# TYPE ingestion_reconnects counter",
-            f"ingestion_reconnects {self.reconnects}",
-            "# TYPE ingestion_disconnects counter",
-            f"ingestion_disconnects {self.disconnects}",
-        ]
+        lines = render_counters(
+            "ingestion",
+            {
+                "events_seen": self.events_seen,
+                "events_normalized": self.events_normalized,
+                "publish_attempts": self.publish_attempts,
+                "unique_publishes": self.unique_publishes,
+                "news_publishes": self.news_publishes,
+                "duplicate_events": self.duplicate_events,
+                "reconnects": self.reconnects,
+                "disconnects": self.disconnects,
+            },
+        )
         lines.extend(self.http.render("ingestion"))
         return "\n".join(lines) + "\n"
 
@@ -157,6 +133,10 @@ class IngestionService:
                 await asyncio.sleep(self._reconnect_backoff_seconds)
 
         return self.metrics
+
+    async def close(self) -> None:
+        """Release every backend that owns a connection."""
+        await close_backends((self._bus,), log=self._log, service_name="ingestion")
 
     async def health(self) -> dict[str, Any]:
         return {

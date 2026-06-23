@@ -23,7 +23,7 @@ Exchange WebSockets / News REST
     → api service  (REST + WebSocket, Druid / Redis / Elasticsearch / Service Bus backed)
 ```
 
-Current branch state: T0–T21 are complete on `feat/market-intel-platform`. Final-review fixes are included in commit `a81ed1e` and cover Azure Service Bus sectioned body decoding, New Relic runtime package pins, and the Druid Kafka-extension cleanup. Do not re-dispatch completed tasks.
+Build state: T0–T21 are complete and merged. `main` is the trunk and carries the current state; feature work branches off it and merges back. Do not re-dispatch completed tasks.
 
 ---
 
@@ -37,7 +37,7 @@ Current branch state: T0–T21 are complete on `feat/market-intel-platform`. Fin
 | API | FastAPI + Uvicorn |
 | Messaging | Azure Service Bus (`azure-servicebus` SDK) + local emulator |
 | Time-series | Apache Druid |
-| Relational | PostgreSQL 16 (app metadata + Druid metadata store) |
+| Relational | PostgreSQL 16 (Druid metadata store) |
 | Cache | Redis 7 |
 | Vector / log store | Elasticsearch 8 kNN (`dense_vector`) |
 | LLM provider | One OpenAI-compatible client (`OPENAI_BASE_URL` → OpenAI / Azure OpenAI / Anthropic / local); MOCK_LLM default, no key required. See ADR 0006 |
@@ -45,8 +45,7 @@ Current branch state: T0–T21 are complete on `feat/market-intel-platform`. Fin
 | Schema / config | Pydantic v2 + pydantic-settings |
 | Logging | structlog (JSON only) |
 | Retry / resilience | tenacity + CircuitBreaker helper in `libs/common` |
-| ORM | SQLAlchemy 2.x async + asyncpg |
-| Data | pandas / numpy |
+| Data | numpy |
 | Tests | pytest + pytest-asyncio |
 | Observability | structlog → Elasticsearch, New Relic APM (opt-in, key required), Grafana dashboards |
 | Containers | Docker + Docker Compose |
@@ -85,6 +84,7 @@ Each service and `libs/common` has its own `README.md`, `pyproject.toml`/`requir
 task setup      # Create .venv (python3.11) and install pinned dev deps — idempotent
 task test       # THE gate: must stay green for the whole repo at every commit
 task lint       # ruff check .
+task typecheck  # mypy static analysis (CI-enforced)
 task format     # black + ruff --fix
 task up         # docker compose up -d
 task down       # docker compose down -v
@@ -210,4 +210,5 @@ Local Druid uses the micro-quickstart profile with PostgreSQL metadata storage, 
 - Conventional-commit subjects: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, etc.
 - One commit per task (per task brief).
 - Stage only files the task created/changed. Do not commit `.venv/`, caches, or build artifacts.
-- All work on branch `feat/market-intel-platform`. Never commit to `main`.
+- Trunk-based: `main` is the integration branch. Branch off it for a change and
+  merge back; do not treat `main` as off-limits.

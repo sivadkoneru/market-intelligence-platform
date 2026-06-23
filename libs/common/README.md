@@ -13,8 +13,9 @@ package — no per-service duplicate event models.
 | Module | Purpose |
 |---|---|
 | `schema.py` | Pydantic v2 event models + topic constants + idempotency key helper |
-| `config.py` | `pydantic-settings` `Settings` with offline-safe defaults and `get_settings()` |
-| `logging.py` | structlog JSON logger, FastAPI request observability middleware, ES log sink, optional New Relic bootstrap |
+| `config.py` | `pydantic-settings` `Settings` with offline-safe defaults, `get_settings()`, `resolve_settings()`, `is_default()` |
+| `logging.py` | structlog JSON logger, FastAPI request observability middleware, ES log sink, shared metric bases, optional New Relic bootstrap |
+| `service_app.py` | Shared FastAPI bootstrap: logging/New Relic setup, background-worker lifespan, and the common `/`, `/health`, `/metrics` routes |
 
 ---
 
@@ -157,6 +158,74 @@ install_observability(app, service_name="api", metrics=my_metrics)
 configure_new_relic(settings, service_name="api")  # no-op without config/module
 ```
 
+### Service metrics
+
+Each service's metrics dataclass extends `ServiceMetrics` (HTTP counters plus the
+`record_http_request` hook the middleware calls) or `WorkerMetrics` (adds
+`last_error` for `run_poll_loop`). Counter lines come from `render_counters()`
+so a metric costs one dict entry instead of two hand-written strings.
+
+```python
+from dataclasses import dataclass
+
+from libs.common import WorkerMetrics, render_counters
+
+
+@dataclass
+class StreamMetrics(WorkerMetrics):
+    messages_seen: int = 0
+    dead_lettered: int = 0
+
+    def render(self) -> str:
+        lines = render_counters(
+            "stream",
+            {"messages_seen": self.messages_seen, "dead_lettered": self.dead_lettered},
+        )
+        lines.extend(self.http.render("stream"))
+        return "\n".join(lines) + "\n"
+```
+
+### service_app.py — shared FastAPI bootstrap
+
+All five services are built from one factory, so the observability contract and
+the required disclaimer live in a single place.
+
+```python
+from libs.common.service_app import (
+    bootstrap_service_logging,
+    create_service_app,
+    worker_lifespan,
+)
+
+
+def create_app(service=None, *, run_on_startup=True):
+    bootstrap_service_logging("stream")          # structlog + New Relic
+    resolved = service or build_default_service()
+
+    return create_service_app(
+        service_name="stream",
+        title="Market Intelligence Stream Service",
+        summary="Portfolio service for offline-safe market stream processing.",
+        service=resolved,
+        state_attr="stream_service",
+        render_metrics=resolved.metrics.render,
+        lifespan=worker_lifespan(
+            resolved.run_forever if run_on_startup else None,
+            task_name="stream-worker",
+            state_attr="stream_task",
+        ),
+    )
+```
+
+`create_service_app` always registers `/`, `/health`, and `/metrics`, installs
+the observability middleware, and appends "No financial advice. No real trades."
+to the OpenAPI description — no service can ship without it. `worker_lifespan`
+cancels and awaits the background task on shutdown so a worker cannot outlive
+its app, and runs the optional `close` callback afterwards even when the worker
+crashed. Pass `display_name` when the public name differs from the short name
+used for logs and metric prefixes (`ai` publishes `ai-analysis`); pass `routes`
+to advertise endpoints on `/`.
+
 ---
 
 ## Inputs / Outputs
@@ -176,7 +245,6 @@ All pinned in `/requirements-dev.txt`:
 | `pydantic` | 2.9.2 | Event models |
 | `pydantic-settings` | 2.6.1 | `Settings` / env loading |
 | `structlog` | 24.4.0 | JSON logging |
-| `orjson` | 3.10.12 | Fast JSON serialisation |
 | `tenacity` | 9.0.0 | Retry policies |
 | `redis` | 5.2.1 | RedisCache real client |
 | `elasticsearch` | 8.17.0 | ElasticsearchStore real client |
@@ -200,7 +268,7 @@ Factories select the fake when the env var is absent/default (fully offline).
 
 | Module | Port class | Fake | Real client | Factory |
 |---|---|---|---|---|
-| `resilience.py` | — | — | — | `retry_async()`, `with_retry()`, `CircuitBreaker` |
+| `resilience.py` | — | — | — | `retry_async()`, `with_retry()`, `CircuitBreaker`, `run_poll_loop()`, `dead_letter_message()`, `close_backends()` |
 | `bus.py` | `MessageBus` | `InMemoryBus` | `ServiceBusBus` | `get_message_bus()` |
 | `redis_client.py` | `Cache` | `InMemoryCache` | `RedisCache` | `get_cache()` |
 | `druid.py` | `TimeSeriesStore` | `InMemoryTimeSeriesStore` | `DruidClient` | `get_timeseries_store()` |
@@ -226,6 +294,51 @@ try:
 except CircuitOpenError:
     # circuit is open — fail fast
     ...
+```
+
+**Consumer loop.** Every service worker (`stream`, `ai`, `alerting`) drives its
+`poll_once` through the one shared loop rather than hand-rolling it. A consumer
+that dies on the first Service Bus or Redis blip fails invisibly — the
+background task ends while `/health` still reports `ok` — so the loop records
+the failure on `metrics.last_error`, logs it, and retries. It returns only via
+cancellation.
+
+```python
+from libs.common import run_poll_loop
+
+async def run_forever(self, *, poll_interval_seconds=0.25, max_messages=10) -> None:
+    await run_poll_loop(
+        self.poll_once,
+        service_name="stream",
+        log=self._log,
+        metrics=self.metrics,
+        poll_interval_seconds=poll_interval_seconds,
+        max_messages=max_messages,
+    )
+```
+
+**Dead-lettering and shutdown.** `dead_letter_message()` performs the three
+steps a consumer must not get partially right — count it, remember the reason,
+hand it to the broker — and logs a `<service>.dead_lettered` event.
+`close_backends()` closes each backend that exposes `close()`, logging rather
+than raising, so one unreachable backend cannot strand the sockets held by the
+rest. All five services call it from their lifespan — `RedisCache`,
+`ServiceBusBus`, `ElasticsearchStore`, and `DruidClient` all hold persistent
+connections, so a service that skips this leaks one set per restart.
+
+```python
+from libs.common import close_backends, dead_letter_message
+
+await dead_letter_message(
+    message,
+    "invalid signal payload",
+    bus=self._bus,
+    log=self._log,
+    metrics=self.metrics,
+    service_name="alerting",
+)
+
+await close_backends((self._store, self._cache, self._bus), log=self._log, service_name="api")
 ```
 
 ### bus.py — Message Bus (Azure Service Bus)
@@ -274,6 +387,35 @@ if await cache.set_if_absent("lock:event-id-xyz", True, ttl=300):
     process_event()
 ```
 
+**Serialisation: JSON, never pickle.** `RedisCache` encodes with
+`encode_cache_value` / `decode_cache_value`. Redis holds data from outside the
+process, and `pickle.loads` on those bytes is arbitrary code execution
+(CWE-502). Every value the platform caches is already JSON-native, so cached
+values must stay JSON-serialisable; a payload that is not valid JSON on read
+raises `ValueError` naming the key rather than degrading to a silent miss.
+
+**Every idempotency marker needs a TTL.** Use `IDEMPOTENCY_TTL_SECONDS` (24 h)
+for "already handled this event" keys. Without one, each unique event leaves a
+permanent key and the store grows without bound. `seen()` writes the marker and
+its TTL in one `SET ... NX EX`, not `SETNX` then `EXPIRE` — the two-command form
+is not atomic, and a process that dies between them leaves a key that never
+expires.
+
+**Key namespaces are defined once.** `snapshot_key()` and `seen_key()` (with the
+`SNAPSHOT_PREFIX` / `SEEN_PREFIX` constants) are the single definition of a
+cross-process contract: the stream service writes snapshots and the API reads
+them, so the fake and the real client must never drift apart on the format.
+
+**`set_if_absent` keys on presence, not truthiness.** `get()` returns `None`
+both for a missing key and for one storing `None`, so testing its result would
+hand out a lock another worker already holds. Both implementations match Redis
+`SET NX`: any existing key is held, whatever its value.
+
+**Fake/real conformance.** The suite runs against `InMemoryCache` while
+production runs against `RedisCache`, so a behavioural gap between them is a bug
+the tests cannot see. `libs/common/tests/test_cache.py` runs one parametrised
+conformance set against *both*; add to it whenever you touch either class.
+
 ### druid.py — Time-Series Store (Apache Druid)
 
 ```python
@@ -281,12 +423,20 @@ from libs.common import get_timeseries_store
 
 store = get_timeseries_store()  # InMemoryTimeSeriesStore offline
 
-await store.ingest([{"symbol": "BTCUSDT", "ts": datetime.utcnow(), "price": 60000}])
+await store.ingest([{"symbol": "BTCUSDT", "ts": datetime.now(UTC), "price": 60000}])
 latest = await store.latest("BTCUSDT")
 rows = await store.history("BTCUSDT", frm=start, to=end)
 n = await store.count()
 results = await store.query_sql("SELECT COUNT(*) FROM ticks")
+await store.close()   # DruidClient only; no-op-safe if never used
 ```
+
+**Connection reuse.** `DruidClient` builds one `httpx.AsyncClient` lazily and
+keeps it for its lifetime, mirroring how `ServiceBusBus` caches senders and
+receivers. Ingest and query are the hottest paths in the platform, so a client
+per call meant a new TCP connection (and, over TLS, a full handshake) for every
+tick and every query. Services release it through `close_backends()` on
+shutdown — all five now do.
 
 ### es.py — Search / Vector Store (Elasticsearch)
 
@@ -321,6 +471,11 @@ Elasticsearch `knn` dense-vector queries.
 | Non-default `DRUID_URL` | `DruidClient` |
 | `ELASTICSEARCH_URL = http://localhost:9200` (default) | `InMemorySearchStore` |
 | Non-default `ELASTICSEARCH_URL` | `ElasticsearchStore` |
+
+Each factory decides "is this still the placeholder?" via `is_default(field, value)`,
+which compares against the declared default on `Settings`. Do not re-spell a default
+URL at a call site — a change to the default here would then silently flip that
+factory into building a *real* client against an address nobody configured.
 
 Real clients are thin wrappers and should only be exercised by `@pytest.mark.integration`
 tests that skip gracefully without live infra.

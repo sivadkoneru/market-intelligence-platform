@@ -116,10 +116,9 @@ def _normalize_post(
 
 async def _fetch_rest_json(url: str) -> Any:
     timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.json()
+    async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as response:
+        response.raise_for_status()
+        return await response.json()
 
 
 class RestSocialCollector:

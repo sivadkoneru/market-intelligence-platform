@@ -172,6 +172,7 @@ def _dedupe_key(
 
 
 def _float_or_none(value: object) -> float | None:
-    if value is None:
-        return None
-    return float(value)
+    """Coerce an indicator value to float, treating anything non-numeric as absent."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None

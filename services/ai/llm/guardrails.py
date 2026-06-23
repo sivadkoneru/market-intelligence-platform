@@ -95,7 +95,15 @@ def apply_guardrails(
     min_confidence: float = 0.45,
     min_overlap_ratio: float = 0.08,
 ) -> tuple[GenerationResult, GuardrailReport]:
-    """Return a result updated with groundedness flags plus its evaluation report."""
+    """
+    Return a result updated with groundedness flags plus its evaluation report.
+
+    Citations that are not in the retrieved context are dropped. The model can
+    emit any string it likes, and an unfiltered one flows through ``Insight``
+    into the alerts topic and ``GET /insights/{symbol}`` — publishing a link
+    the system has already determined is fabricated. The report still records
+    ``citation_mismatch`` so the rejection stays visible.
+    """
 
     report = evaluate_result(
         request,
@@ -103,10 +111,14 @@ def apply_guardrails(
         min_confidence=min_confidence,
         min_overlap_ratio=min_overlap_ratio,
     )
+    allowed_citations = {document.citation for document in request.context}
+    grounded_citations = tuple(
+        citation for citation in result.citations if citation in allowed_citations
+    )
     guarded = replace(
         result,
+        citations=grounded_citations,
         grounded=report.grounded,
         metadata={**result.metadata, "guardrail_reasons": list(report.reasons)},
     )
     return guarded, report
-

@@ -22,14 +22,55 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
+# Lowest supported interpreter — the local venv is 3.11 even though the runtime
+# images are 3.12, so linting must not accept 3.12-only syntax.
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+# E/F/I: pycodestyle errors, pyflakes, import sorting.
+# W:     pycodestyle warnings (trailing whitespace, blank-line issues).
+# B:     flake8-bugbear — catches real defects such as mutable ContextVar
+#        defaults and zip() silently truncating to the shorter sequence.
+# C4:    flake8-comprehensions.
+# UP:    pyupgrade — keeps the code on modern 3.11+ idioms.
+# SIM:   flake8-simplify.
+select = ["E", "F", "I", "W", "B", "C4", "UP", "SIM"]
+ignore = [
+    # UP038 rewrites `isinstance(x, (int, float))` into `isinstance(x, int | float)`.
+    # The union form is measurably SLOWER than the tuple at runtime — CPython has a
+    # fast path for the tuple — and these call sites are per-row/per-event hot paths
+    # (timestamp parsing, payload normalisation). Ruff itself later deprecated the
+    # rule for this reason.
+    "UP038",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom *is* a call in an argument default;
+# B008 would flag every route in the API service as a bug.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.Path",
+    "fastapi.Query",
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["libs", "services"]
 
 [tool.black]
 line-length = 100
-target-version = ["py312"]
+# Both runtimes: the venv is 3.11 and the images are 3.12, so formatting has to
+# stay valid on the older of the two.
+target-version = ["py311", "py312"]
+
+[tool.mypy]
+python_version = "3.11"
+# Pragmatic baseline: catch real type errors without demanding full annotation
+# coverage. Third-party stubs are optional, so a missing SDK stub never blocks
+# the check.
+ignore_missing_imports = true
+explicit_package_bases = true
+mypy_path = "."
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

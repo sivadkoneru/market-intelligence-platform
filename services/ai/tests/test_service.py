@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -89,7 +89,7 @@ def _news_message(
 ) -> tuple[dict[str, Any], str]:
     payload = {
         "event_id": f"ev-{message_id}",
-        "ts": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+        "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
         "source": "newswire",
         "title": title,
         "body": body,
@@ -110,7 +110,7 @@ def _signal_message(
 ) -> tuple[dict[str, Any], str]:
     payload = {
         "event_id": f"ev-{message_id}",
-        "ts": datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc).isoformat(),
+        "ts": datetime(2026, 1, 1, 0, 1, tzinfo=UTC).isoformat(),
         "symbol": symbol,
         "source": "stream",
         "indicators": {
@@ -211,7 +211,10 @@ async def test_service_applies_guardrails_before_publish() -> None:
     insights = await bus.peek(TOPIC_INSIGHTS, "observer", n=10)
     assert len(insights) == 1
     assert insights[0].body["grounded"] is False
-    assert insights[0].body["citations"] == ["missing-source"]
+    # A citation the model invented is not in the retrieved context, so it must
+    # not reach consumers — publishing it would hand users a link the system
+    # already knows is fabricated.
+    assert insights[0].body["citations"] == []
 
 
 @pytest.mark.asyncio
@@ -412,9 +415,7 @@ async def test_run_forever_retries_after_transient_poll_failure() -> None:
         llm_provider=provider,
     )
 
-    worker = asyncio.create_task(
-        service.run_forever(poll_interval_seconds=0.01, max_messages=1)
-    )
+    worker = asyncio.create_task(service.run_forever(poll_interval_seconds=0.01, max_messages=1))
     try:
         for _ in range(50):
             if service.metrics.messages_processed:
@@ -429,3 +430,36 @@ async def test_run_forever_retries_after_transient_poll_failure() -> None:
     assert service.metrics.last_error == "ai polling failed: ConnectionError: service bus not ready"
     insights = await bus.peek(TOPIC_INSIGHTS, "observer", n=10)
     assert len(insights) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_releases_every_backend_even_when_one_fails() -> None:
+    """The AI service used to leak its clients on every restart."""
+    closed: list[str] = []
+
+    class FailingSearchStore(InMemorySearchStore):
+        async def close(self) -> None:
+            closed.append("search")
+            raise RuntimeError("elasticsearch down")
+
+    class RecordingCache(InMemoryCache):
+        async def close(self) -> None:
+            closed.append("cache")
+
+    class RecordingBus(InMemoryBus):
+        async def close(self) -> None:
+            closed.append("bus")
+
+    search_store = FailingSearchStore()
+    provider = MockLLMProvider()
+    service = AIAnalysisService(
+        bus=RecordingBus(),
+        cache=RecordingCache(),
+        search_store=search_store,
+        rag_pipeline=RAGPipeline(search_store=search_store, embedding_provider=provider),
+        llm_provider=provider,
+    )
+
+    await service.close()
+
+    assert closed == ["search", "cache", "bus"]

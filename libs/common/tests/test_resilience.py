@@ -1,4 +1,7 @@
-"""Tests for libs.common.resilience — retry helper and circuit breaker."""
+"""Tests for libs.common.resilience — retry, circuit breaker, and consumer helpers."""
+
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 from tenacity import RetryError
@@ -7,6 +10,8 @@ from libs.common.resilience import (
     CircuitBreaker,
     CircuitOpenError,
     CircuitState,
+    close_backends,
+    dead_letter_message,
     retry_async,
     with_retry,
 )
@@ -212,3 +217,164 @@ async def test_circuit_success_resets_failure_count():
     await cb.call(ok)
     assert cb.state == CircuitState.CLOSED
     assert cb._failure_count == 0
+
+
+# ---------------------------------------------------------------------------
+# dead_letter_message
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBus:
+    def __init__(self) -> None:
+        self.dead_lettered: list[tuple[object, str]] = []
+
+    async def dead_letter(self, message, reason=""):
+        self.dead_lettered.append((message, reason))
+
+
+class _RecordingLog:
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict]] = []
+
+    def warning(self, event, **kwargs):
+        self.warnings.append((event, kwargs))
+
+
+@dataclass
+class _DLMetrics:
+    dead_lettered: int = 0
+    last_error: str | None = None
+
+
+def _message(topic="signals", subscription="alerting", message_id="m-1"):
+    return SimpleNamespace(topic=topic, subscription=subscription, message_id=message_id)
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_message_hands_the_message_to_the_bus():
+    bus, log, metrics = _RecordingBus(), _RecordingLog(), _DLMetrics()
+    msg = _message()
+
+    await dead_letter_message(
+        msg, "bad payload", bus=bus, log=log, metrics=metrics, service_name="alerting"
+    )
+
+    assert bus.dead_lettered == [(msg, "bad payload")]
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_message_records_the_reason_on_metrics():
+    bus, log, metrics = _RecordingBus(), _RecordingLog(), _DLMetrics()
+
+    await dead_letter_message(
+        _message(), "bad payload", bus=bus, log=log, metrics=metrics, service_name="alerting"
+    )
+
+    assert metrics.dead_lettered == 1
+    assert metrics.last_error == "bad payload"
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_message_logs_a_service_scoped_event():
+    """The event name keeps each service distinguishable in the shared log stream."""
+    bus, log, metrics = _RecordingBus(), _RecordingLog(), _DLMetrics()
+
+    await dead_letter_message(
+        _message(message_id="m-9"),
+        "boom",
+        bus=bus,
+        log=log,
+        metrics=metrics,
+        service_name="stream",
+    )
+
+    event, fields = log.warnings[0]
+    assert event == "stream.dead_lettered"
+    assert fields["topic"] == "signals"
+    assert fields["subscription"] == "alerting"
+    assert fields["message_id"] == "m-9"
+    assert fields["reason"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_message_accumulates_across_calls():
+    bus, log, metrics = _RecordingBus(), _RecordingLog(), _DLMetrics()
+
+    await dead_letter_message(
+        _message(), "first", bus=bus, log=log, metrics=metrics, service_name="ai"
+    )
+    await dead_letter_message(
+        _message(), "second", bus=bus, log=log, metrics=metrics, service_name="ai"
+    )
+
+    assert metrics.dead_lettered == 2
+    assert metrics.last_error == "second"
+
+
+# ---------------------------------------------------------------------------
+# close_backends
+# ---------------------------------------------------------------------------
+
+
+class _Backend:
+    def __init__(self, *, fails: bool = False, sync: bool = False) -> None:
+        self.closed = 0
+        self._fails = fails
+        self._sync = sync
+
+    def close(self):
+        if self._sync:
+            self.closed += 1
+            if self._fails:
+                raise RuntimeError("sync close failed")
+            return None
+        return self._aclose()
+
+    async def _aclose(self):
+        self.closed += 1
+        if self._fails:
+            raise RuntimeError("async close failed")
+
+
+class _NoCloseBackend:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_close_backends_closes_every_backend():
+    backends = [_Backend(), _Backend(), _Backend(sync=True)]
+
+    await close_backends(backends, log=_RecordingLog(), service_name="api")
+
+    assert [b.closed for b in backends] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_close_backends_skips_backends_without_close():
+    log = _RecordingLog()
+
+    await close_backends([_NoCloseBackend()], log=log, service_name="api")
+
+    assert log.warnings == []
+
+
+@pytest.mark.asyncio
+async def test_close_backends_continues_past_a_failing_backend():
+    """One unreachable backend must not strand the sockets held by the others."""
+    failing, healthy = _Backend(fails=True), _Backend()
+
+    await close_backends([failing, healthy], log=_RecordingLog(), service_name="api")
+
+    assert healthy.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_close_backends_logs_each_failure():
+    log = _RecordingLog()
+
+    await close_backends([_Backend(fails=True)], log=log, service_name="ai")
+
+    event, fields = log.warnings[0]
+    assert event == "ai.backend_close_failed"
+    assert fields["backend"] == "_Backend"
+    assert "async close failed" in fields["error"]

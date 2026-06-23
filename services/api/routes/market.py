@@ -6,10 +6,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from services.api.dependencies import get_api_service
+from services.api.dependencies import SymbolPath, get_api_service, normalize_symbol
 from services.api.service import APIService
 
 router = APIRouter(tags=["market"])
+
+MAX_HISTORY_ROWS = 10_000
 
 
 @router.get("/symbols")
@@ -22,34 +24,44 @@ async def list_symbols(
 
 @router.get("/market/{symbol}/latest")
 async def get_latest_market(
-    symbol: str,
+    symbol: SymbolPath,
     service: APIService = Depends(get_api_service),
 ) -> dict[str, object]:
-    payload = await service.latest_market(symbol)
+    resolved = normalize_symbol(symbol)
+    payload = await service.latest_market(resolved)
     if payload is None:
-        raise HTTPException(status_code=404, detail=f"No market data found for {symbol}")
+        raise HTTPException(status_code=404, detail=f"No market data found for {resolved}")
     return payload
 
 
 @router.get("/market/{symbol}/history")
 async def get_market_history(
-    symbol: str,
+    symbol: SymbolPath,
     frm: datetime = Query(..., alias="from"),
     to: datetime = Query(...),
+    limit: int = Query(1_000, ge=1, le=MAX_HISTORY_ROWS),
     service: APIService = Depends(get_api_service),
 ) -> dict[str, object]:
     if frm > to:
         raise HTTPException(status_code=400, detail="'from' must be before or equal to 'to'")
-    rows = await service.market_history(symbol, frm=frm, to=to)
-    return {"symbol": symbol, "from": frm.isoformat(), "to": to.isoformat(), "rows": rows}
+    resolved = normalize_symbol(symbol)
+    rows = await service.market_history(resolved, frm=frm, to=to, limit=limit)
+    return {
+        "symbol": resolved,
+        "from": frm.isoformat(),
+        "to": to.isoformat(),
+        "rows": rows,
+        "count": len(rows),
+    }
 
 
 @router.get("/indicators/{symbol}")
 async def get_indicators(
-    symbol: str,
+    symbol: SymbolPath,
     service: APIService = Depends(get_api_service),
 ) -> dict[str, object]:
-    payload = await service.indicators(symbol)
+    resolved = normalize_symbol(symbol)
+    payload = await service.indicators(resolved)
     if payload is None:
-        raise HTTPException(status_code=404, detail=f"No indicators found for {symbol}")
+        raise HTTPException(status_code=404, detail=f"No indicators found for {resolved}")
     return payload

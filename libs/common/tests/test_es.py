@@ -2,6 +2,7 @@
 
 import math
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -66,8 +67,8 @@ async def test_search_empty_index():
 async def test_index_log():
     store = InMemorySearchStore()
     await store.index_log("logs", {"level": "info", "msg": "started"})
-    assert len(store._logs["logs"]) == 1
-    assert store._logs["logs"][0]["msg"] == "started"
+    assert len(store.logs("logs")) == 1
+    assert store.logs("logs")[0]["msg"] == "started"
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ async def test_knn_returns_nearest_by_cosine():
     Expected order: d0 (score=1.0) > d45 (≈0.707) > d90 (score=0.0).
     """
     store = InMemorySearchStore()
-    await store.index_document("vec", "d0",  {"label": "d0"},  vector=[1.0, 0.0])
+    await store.index_document("vec", "d0", {"label": "d0"}, vector=[1.0, 0.0])
     await store.index_document("vec", "d45", {"label": "d45"}, vector=[1.0, 1.0])
     await store.index_document("vec", "d90", {"label": "d90"}, vector=[0.0, 1.0])
 
@@ -91,7 +92,7 @@ async def test_knn_returns_nearest_by_cosine():
 
     assert len(results) == 3
     ids = [r["_id"] for r in results]
-    assert ids[0] == "d0"   # closest
+    assert ids[0] == "d0"  # closest
     assert ids[2] == "d90"  # furthest
 
 
@@ -196,7 +197,7 @@ class _FakeIndices:
 
 def _elastic_store_with_indices(indices: _FakeIndices) -> ElasticsearchStore:
     store = ElasticsearchStore.__new__(ElasticsearchStore)
-    store._es = SimpleNamespace(indices=indices)
+    store._es = cast(Any, SimpleNamespace(indices=indices))
     return store
 
 

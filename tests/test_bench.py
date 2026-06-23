@@ -103,6 +103,9 @@ def test_bench_script_avoids_bare_print_calls() -> None:
     tree = ast.parse(source)
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id == "print":
-                pytest.fail("Found bare print() call in scripts/bench.py")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ):
+            pytest.fail("Found bare print() call in scripts/bench.py")

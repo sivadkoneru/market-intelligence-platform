@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from libs.common import Insight, Signal
 from services.alerting.rules import RuleEngine
@@ -7,7 +7,7 @@ from services.alerting.rules import RuleEngine
 def test_signal_rules_emit_threshold_and_anomaly_alerts() -> None:
     signal = Signal(
         event_id="sig-1",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         symbol="BTCUSDT",
         indicators={
             "rsi": 78.5,
@@ -31,7 +31,7 @@ def test_signal_rules_emit_threshold_and_anomaly_alerts() -> None:
 def test_signal_rules_emit_oversold_alert() -> None:
     signal = Signal(
         event_id="sig-2",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         symbol="ETHUSDT",
         indicators={"rsi": 24.0, "volatility": 0.01},
         anomaly=False,
@@ -47,7 +47,7 @@ def test_signal_rules_emit_oversold_alert() -> None:
 def test_insight_rules_emit_sentiment_spike_alert() -> None:
     insight = Insight(
         event_id="ins-1",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         symbol="SOLUSDT",
         sentiment_score=-0.92,
         sentiment_label="very_negative",
@@ -69,7 +69,7 @@ def test_insight_rules_emit_sentiment_spike_alert() -> None:
 def test_insight_rules_ignore_small_sentiment_moves() -> None:
     insight = Insight(
         event_id="ins-2",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         symbol="ADAUSDT",
         sentiment_score=0.2,
         sentiment_label="neutral",

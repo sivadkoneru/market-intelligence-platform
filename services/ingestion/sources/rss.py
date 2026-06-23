@@ -4,6 +4,7 @@ RSS feed collector for the ingestion service.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -20,8 +21,18 @@ from services.ingestion.sources.base import (
     normalize_symbols,
 )
 
-_RSS_ITEM_FIELDS = ("title", "description", "link", "author", "pubDate", "guid")
-_ATOM_ENTRY_FIELDS = ("title", "summary", "content", "link", "author", "updated", "published")
+# Feed bodies are untrusted remote input.
+MAX_FEED_BYTES = 5 * 1024 * 1024
+MAX_ENTRIES_PER_FEED = 500
+
+# ``xml.etree`` expands internal entities, so a DOCTYPE with nested entity
+# declarations is a billion-laughs amplifier (four levels turns 5 lines into
+# 100 MB). ``defusedxml`` is off the approved stack and the C ``XMLParser``
+# does not expose its expat handle, so the declaration itself is refused
+# instead — no RSS or Atom feed needs a DTD.
+_DOCTYPE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
+_ROOT_ELEMENT_START = re.compile(r"<[A-Za-z_]")
+_PROLOG_SCAN_LIMIT = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -71,12 +82,36 @@ def _first_text(*values: str | None) -> str | None:
     return None
 
 
+def _reject_doctype(xml_payload: str | bytes) -> None:
+    """
+    Raise if the document declares a DTD.
+
+    Only the prolog — everything before the root element's start tag — is
+    scanned, so a feed whose article text happens to mention ``<!DOCTYPE`` is
+    still accepted.
+    """
+    head = xml_payload[:_PROLOG_SCAN_LIMIT]
+    if isinstance(head, bytes):
+        head = head.decode("utf-8", "replace")
+
+    root_start = _ROOT_ELEMENT_START.search(head)
+    prolog = head[: root_start.start()] if root_start else head
+    if _DOCTYPE.search(prolog):
+        raise ValueError("feed declares a DOCTYPE; refusing to parse untrusted DTD")
+
+
 def _parse_feed_entries(xml_payload: str | bytes) -> list[ET.Element]:
+    if len(xml_payload) > MAX_FEED_BYTES:
+        raise ValueError(f"feed payload exceeds {MAX_FEED_BYTES} bytes")
+    _reject_doctype(xml_payload)
+
     root = ET.fromstring(xml_payload)
     root_name = _local_name(root.tag)
     if root_name == "feed":
-        return [entry for entry in root if _local_name(entry.tag) == "entry"]
-    return [item for item in root.iter() if _local_name(item.tag) == "item"]
+        entries = [entry for entry in root if _local_name(entry.tag) == "entry"]
+    else:
+        entries = [item for item in root.iter() if _local_name(item.tag) == "item"]
+    return entries[:MAX_ENTRIES_PER_FEED]
 
 
 def _normalize_rss_entry(
@@ -125,10 +160,14 @@ def _normalize_rss_entry(
 
 async def _fetch_rss_text(url: str) -> str:
     timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.text()
+    async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as response:
+        response.raise_for_status()
+        # Read with a hard cap rather than response.text(): a hostile or
+        # broken feed must not be able to stream unbounded bytes into memory.
+        raw = await response.content.read(MAX_FEED_BYTES + 1)
+        if len(raw) > MAX_FEED_BYTES:
+            raise ValueError(f"feed at {url} exceeds {MAX_FEED_BYTES} bytes")
+        return raw.decode(response.charset or "utf-8", "replace")
 
 
 class RssCollector:

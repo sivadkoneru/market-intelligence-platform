@@ -36,5 +36,8 @@ steps:
   - script: .venv/bin/ruff check .
     displayName: Ruff lint
 
+  - script: .venv/bin/mypy libs services scripts tests conftest.py
+    displayName: Mypy type check
+
   - script: .venv/bin/pytest -q
     displayName: Pytest

@@ -66,37 +66,31 @@ class MessageBus(Protocol):
         *,
         message_id: str | None = None,
         correlation_id: str | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def receive(
         self,
         topic: str,
         subscription: str,
         max_messages: int = 10,
-    ) -> list[ReceivedMessage]:
-        ...
+    ) -> list[ReceivedMessage]: ...
 
-    async def complete(self, msg: ReceivedMessage) -> None:
-        ...
+    async def complete(self, msg: ReceivedMessage) -> None: ...
 
-    async def dead_letter(self, msg: ReceivedMessage, reason: str = "") -> None:
-        ...
+    async def dead_letter(self, msg: ReceivedMessage, reason: str = "") -> None: ...
 
     async def peek(
         self,
         topic: str,
         subscription: str,
         n: int = 10,
-    ) -> list[ReceivedMessage]:
-        ...
+    ) -> list[ReceivedMessage]: ...
 
     async def receive_dead_letter(
         self,
         topic: str,
         subscription: str,
-    ) -> list[ReceivedMessage]:
-        ...
+    ) -> list[ReceivedMessage]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +203,12 @@ class InMemoryBus:
 # ---------------------------------------------------------------------------
 
 
-def _build_servicebus_bus(connection_string: str) -> "ServiceBusBus":
+def _build_servicebus_bus(connection_string: str) -> ServiceBusBus:
     try:
         from azure.servicebus.aio import ServiceBusClient  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "azure-servicebus is not installed. "
-            "Install it with: pip install azure-servicebus"
+            "azure-servicebus is not installed. " "Install it with: pip install azure-servicebus"
         ) from exc
     return ServiceBusBus(connection_string)
 
@@ -245,8 +238,6 @@ def _decode_servicebus_body(raw_body: Any) -> dict[str, Any]:
         for section in raw_body:
             if isinstance(section, str):
                 chunks.append(section.encode("utf-8"))
-            elif isinstance(section, (bytes, bytearray, memoryview)):
-                chunks.append(bytes(section))
             else:
                 chunks.append(bytes(section))
         data = b"".join(chunks)
@@ -280,8 +271,7 @@ class ServiceBusBus:
 
         self._connection_string = connection_string
         self._client = ServiceBusClient.from_connection_string(connection_string)
-        # topic → sender  (each sender is recreated per publish — senders are
-        # lightweight and the async-with pattern closes them on exit)
+        # topic → open ServiceBusSender, cached like receivers
         self._senders: dict[str, Any] = {}
         # (topic, subscription, sub_queue) → open ServiceBusReceiver
         self._receivers: dict[tuple[str, str, str | None], Any] = {}
@@ -289,6 +279,19 @@ class ServiceBusBus:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_sender(self, topic: str) -> Any:
+        """
+        Return a cached open sender, creating it lazily.
+
+        Publishing is the hottest path in the platform — one call per market
+        tick — and building a sender per message opens and tears down an AMQP
+        link every time. Senders are cached for the client's lifetime and shut
+        down in :meth:`close`, mirroring the receiver lifecycle.
+        """
+        if topic not in self._senders:
+            self._senders[topic] = self._client.get_topic_sender(topic_name=topic)
+        return self._senders[topic]
 
     def _get_receiver(
         self,
@@ -299,10 +302,18 @@ class ServiceBusBus:
         """Return a cached open receiver, creating it lazily."""
         key = (topic, subscription, sub_queue)
         if key not in self._receivers:
-            kwargs = {"topic_name": topic, "subscription_name": subscription}
-            if sub_queue is not None:
-                kwargs["sub_queue"] = sub_queue
-            self._receivers[key] = self._client.get_subscription_receiver(**kwargs)
+            if sub_queue is None:
+                receiver = self._client.get_subscription_receiver(
+                    topic_name=topic,
+                    subscription_name=subscription,
+                )
+            else:
+                receiver = self._client.get_subscription_receiver(
+                    topic_name=topic,
+                    subscription_name=subscription,
+                    sub_queue=sub_queue,
+                )
+            self._receivers[key] = receiver
         return self._receivers[key]
 
     # ------------------------------------------------------------------
@@ -319,14 +330,12 @@ class ServiceBusBus:
     ) -> None:
         from azure.servicebus import ServiceBusMessage
 
-        sender = self._client.get_topic_sender(topic_name=topic)
         msg = ServiceBusMessage(
             body=json.dumps(body).encode(),
             message_id=message_id or str(uuid.uuid4()),
             correlation_id=correlation_id,
         )
-        async with sender:
-            await sender.send_messages(msg)
+        await self._get_sender(topic).send_messages(msg)
 
     # ------------------------------------------------------------------
     # Consumer
@@ -339,9 +348,7 @@ class ServiceBusBus:
         max_messages: int = 10,
     ) -> list[ReceivedMessage]:
         receiver = self._get_receiver(topic, subscription)
-        received = await receiver.receive_messages(
-            max_message_count=max_messages, max_wait_time=5
-        )
+        received = await receiver.receive_messages(max_message_count=max_messages, max_wait_time=5)
         msgs: list[ReceivedMessage] = []
         for raw in received:
             body = _decode_servicebus_body(raw.body)
@@ -422,7 +429,10 @@ class ServiceBusBus:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close all cached receivers then the underlying client."""
+        """Close all cached senders and receivers, then the underlying client."""
+        for sender in self._senders.values():
+            await sender.close()
+        self._senders.clear()
         for receiver in self._receivers.values():
             await receiver.close()
         self._receivers.clear()
@@ -440,12 +450,9 @@ def get_message_bus(settings: Any = None) -> MessageBus:
     or when SERVICE_BUS_CONNECTION_STRING is unset/empty.
     Otherwise return a ServiceBusBus wrapping the real Azure SDK.
     """
-    if settings is None:
-        from libs.common.config import get_settings
+    from libs.common.config import resolve_settings
 
-        settings = get_settings()
-
-    conn_str: str = settings.service_bus_connection_string or ""
+    conn_str: str = resolve_settings(settings).service_bus_connection_string or ""
     # An unset/empty string means "no real bus"; otherwise a connection string is
     # a placeholder only when it carries one of the known default markers. Empty
     # is handled by falsiness here — never via substring matching, because the

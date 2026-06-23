@@ -231,9 +231,9 @@ class TestComposeServices:
         for svc in DRUID_SERVICES:
             if svc == "druid-router":
                 continue
-            assert not services[svc].get("ports"), (
-                f"{svc} must not publish host ports; only druid-router is exposed"
-            )
+            assert not services[svc].get(
+                "ports"
+            ), f"{svc} must not publish host ports; only druid-router is exposed"
 
     @pytest.mark.parametrize(
         "svc,command",
@@ -251,9 +251,9 @@ class TestComposeServices:
         """Each Druid container launches exactly one named service via `command`."""
         cmd = services[svc].get("command")
         cmd_list = cmd if isinstance(cmd, list) else [cmd]
-        assert cmd_list == [command], (
-            f"{svc} must run `{command}` (apache/druid runs one service per container)"
-        )
+        assert cmd_list == [
+            command
+        ], f"{svc} must run `{command}` (apache/druid runs one service per container)"
 
     def test_druid_shares_local_deep_storage(self, services: dict) -> None:
         """With druid.storage.type=local the segment + indexing-log dirs are shared.
@@ -446,15 +446,40 @@ class TestServiceBusConfig:
             props.get("RequiresDuplicateDetection", False) is False
         ), f"Topic '{topic_name}' should not have RequiresDuplicateDetection=true"
 
-    def test_all_subscriptions_have_dead_lettering(self, topics_by_name: dict) -> None:
-        """All subscriptions should enable DeadLetteringOnMessageExpiration."""
+    def test_consumer_subscriptions_have_dead_lettering(self, topics_by_name: dict) -> None:
+        """Subscriptions that settle messages must dead-letter on expiration."""
         for topic_name, topic in topics_by_name.items():
             for sub in topic.get("Subscriptions", []):
+                if sub["Name"] == "api":
+                    continue
                 props = sub.get("Properties", {})
                 assert props.get("DeadLetteringOnMessageExpiration") is True, (
                     f"Subscription '{sub['Name']}' on topic '{topic_name}' "
                     f"should have DeadLetteringOnMessageExpiration=true"
                 )
+
+    def test_api_read_model_subscriptions_do_not_dead_letter(self, topics_by_name: dict) -> None:
+        """
+        The 'api' subscriptions back a peek-only "latest N" read model.
+
+        Nothing ever settles them, so every message eventually hits the 1-hour
+        TTL. Dead-lettering those would fill a DLQ nobody reads with perfectly
+        healthy messages; expiry is the intended lifecycle here. The 'api-ws'
+        subscriptions do receive-and-complete, so they keep dead-lettering.
+        """
+        api_subs = [
+            (topic_name, sub)
+            for topic_name, topic in topics_by_name.items()
+            for sub in topic.get("Subscriptions", [])
+            if sub["Name"] == "api"
+        ]
+        assert api_subs, "expected 'api' subscriptions in the topology"
+        for topic_name, sub in api_subs:
+            props = sub.get("Properties", {})
+            assert props.get("DeadLetteringOnMessageExpiration") is False, (
+                f"Subscription 'api' on topic '{topic_name}' should not "
+                f"dead-letter on expiration"
+            )
 
     def test_five_topics_total(self, topics_by_name: dict) -> None:
         assert len(topics_by_name) == 5, (

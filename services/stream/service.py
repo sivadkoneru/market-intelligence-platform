@@ -4,26 +4,31 @@ Core stream-processing service loop.
 
 from __future__ import annotations
 
-import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 
 from libs.common import (
+    IDEMPOTENCY_TTL_SECONDS,
     TOPIC_MARKET_RAW,
     TOPIC_SIGNALS,
     Cache,
-    HTTPMetrics,
     MarketEvent,
     MessageBus,
     ReceivedMessage,
     Signal,
     TimeSeriesStore,
+    WorkerMetrics,
+    close_backends,
+    dead_letter_message,
     get_logger,
     market_event_key,
+    render_counters,
+    run_poll_loop,
+    validation_reason,
 )
 from services.stream.indicators import (
     detect_trend,
@@ -35,6 +40,8 @@ from services.stream.indicators import (
     z_score_anomaly,
 )
 
+# Prices retained per symbol = longest indicator window x this multiplier.
+HISTORY_WINDOW_MULTIPLIER = 8
 STREAM_SUBSCRIPTION = "stream"
 IDEMPOTENCY_PREFIX = "stream:processed"
 HISTORY_PREFIX = "history"
@@ -53,9 +60,32 @@ class IndicatorConfig:
     ewma_span: int = 5
     ewma_threshold: float = 3.0
 
+    @property
+    def history_maxlen(self) -> int:
+        """
+        Number of prices retained per symbol.
+
+        The per-symbol history was an unbounded list that every event copied
+        and every indicator walked, so memory and per-event latency grew
+        linearly and without limit for the life of the process. Retaining a
+        generous multiple of the longest window keeps SMA/RSI/volatility exact
+        and leaves the recursive EMA/EWMA terms numerically indistinguishable,
+        while making the cost per event constant.
+        """
+        longest = max(
+            self.sma_window,
+            self.ema_window,
+            self.rsi_period + 1,
+            self.volatility_window,
+            self.trend_window,
+            self.zscore_window,
+            self.ewma_span,
+        )
+        return longest * HISTORY_WINDOW_MULTIPLIER + 1
+
 
 @dataclass
-class StreamMetrics:
+class StreamMetrics(WorkerMetrics):
     messages_seen: int = 0
     messages_processed: int = 0
     duplicates_suppressed: int = 0
@@ -63,45 +93,20 @@ class StreamMetrics:
     dead_lettered: int = 0
     tick_rows_ingested: int = 0
     indicator_rows_ingested: int = 0
-    last_error: str | None = None
-    http: HTTPMetrics = field(default_factory=HTTPMetrics)
-
-    def record_http_request(
-        self,
-        *,
-        method: str,
-        path: str,
-        status_code: int,
-        duration_ms: float,
-        trace_context_provided: bool,
-        correlation_context_provided: bool,
-    ) -> None:
-        self.http.record_http_request(
-            method=method,
-            path=path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-            trace_context_provided=trace_context_provided,
-            correlation_context_provided=correlation_context_provided,
-        )
 
     def render(self) -> str:
-        lines = [
-            "# TYPE stream_messages_seen counter",
-            f"stream_messages_seen {self.messages_seen}",
-            "# TYPE stream_messages_processed counter",
-            f"stream_messages_processed {self.messages_processed}",
-            "# TYPE stream_duplicates_suppressed counter",
-            f"stream_duplicates_suppressed {self.duplicates_suppressed}",
-            "# TYPE stream_signals_published counter",
-            f"stream_signals_published {self.signals_published}",
-            "# TYPE stream_dead_lettered counter",
-            f"stream_dead_lettered {self.dead_lettered}",
-            "# TYPE stream_tick_rows_ingested counter",
-            f"stream_tick_rows_ingested {self.tick_rows_ingested}",
-            "# TYPE stream_indicator_rows_ingested counter",
-            f"stream_indicator_rows_ingested {self.indicator_rows_ingested}",
-        ]
+        lines = render_counters(
+            "stream",
+            {
+                "messages_seen": self.messages_seen,
+                "messages_processed": self.messages_processed,
+                "duplicates_suppressed": self.duplicates_suppressed,
+                "signals_published": self.signals_published,
+                "dead_lettered": self.dead_lettered,
+                "tick_rows_ingested": self.tick_rows_ingested,
+                "indicator_rows_ingested": self.indicator_rows_ingested,
+            },
+        )
         lines.extend(self.http.render("stream"))
         return "\n".join(lines) + "\n"
 
@@ -119,7 +124,12 @@ class StreamProcessor:
 
     def __init__(self, config: IndicatorConfig | None = None) -> None:
         self._config = config or IndicatorConfig()
-        self._price_history: dict[str, list[float]] = defaultdict(list)
+        maxlen = self._config.history_maxlen
+        self._price_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=maxlen))
+
+    def price_history(self, symbol: str) -> tuple[float, ...]:
+        """Return the retained price history for *symbol* (newest last)."""
+        return tuple(self._price_history.get(symbol, ()))
 
     def process(self, event: MarketEvent) -> ProcessedSignal:
         prices = self._candidate_history(event)
@@ -266,22 +276,22 @@ class StreamService:
         poll_interval_seconds: float = 0.25,
         max_messages: int = 10,
     ) -> None:
-        while True:
-            try:
-                processed = await self.poll_once(max_messages=max_messages)
-            except Exception as exc:
-                self.metrics.last_error = (
-                    f"stream polling failed: {type(exc).__name__}: {exc}"
-                )
-                self._log.warning(
-                    "stream.poll_failed",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
-                await asyncio.sleep(poll_interval_seconds)
-                continue
-            if processed == 0:
-                await asyncio.sleep(poll_interval_seconds)
+        await run_poll_loop(
+            self.poll_once,
+            service_name="stream",
+            log=self._log,
+            metrics=self.metrics,
+            poll_interval_seconds=poll_interval_seconds,
+            max_messages=max_messages,
+        )
+
+    async def close(self) -> None:
+        """Release every backend that owns a connection."""
+        await close_backends(
+            (self._store, self._cache, self._bus),
+            log=self._log,
+            service_name="stream",
+        )
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -298,7 +308,7 @@ class StreamService:
         try:
             event = MarketEvent.model_validate(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"invalid market event payload: {exc.errors()}")
+            await self._dead_letter(message, validation_reason("invalid market event payload", exc))
             return
 
         event_key = market_event_key(event.symbol, event.ts, event.source)
@@ -330,7 +340,7 @@ class StreamService:
                 correlation_id=event.correlation_id,
             )
             self.metrics.signals_published += 1
-            await self._cache.set(dedupe_key, True)
+            await self._cache.set(dedupe_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
             self._processor.commit(event)
             self.metrics.messages_processed += 1
             self._log.info(
@@ -348,15 +358,13 @@ class StreamService:
             )
 
     async def _dead_letter(self, message: ReceivedMessage, reason: str) -> None:
-        self.metrics.dead_lettered += 1
-        self.metrics.last_error = reason
-        await self._bus.dead_letter(message, reason=reason)
-        self._log.warning(
-            "stream.dead_lettered",
-            topic=message.topic,
-            subscription=message.subscription,
-            message_id=message.message_id,
-            reason=reason,
+        await dead_letter_message(
+            message,
+            reason,
+            bus=self._bus,
+            log=self._log,
+            metrics=self.metrics,
+            service_name="stream",
         )
 
     async def _append_cached_history(self, symbol: str, row: dict[str, Any]) -> None:
@@ -374,8 +382,6 @@ def _trend_score(trend: str | None) -> float | None:
     return mapping.get(trend) if trend is not None else None
 
 
-def price_history_for_symbol(
-    processor: StreamProcessor, symbol: str
-) -> Sequence[float]:
-    """Test helper for inspecting retained per-symbol history."""
-    return tuple(processor._price_history.get(symbol, ()))
+def price_history_for_symbol(processor: StreamProcessor, symbol: str) -> Sequence[float]:
+    """Deprecated alias for ``StreamProcessor.price_history``."""
+    return processor.price_history(symbol)

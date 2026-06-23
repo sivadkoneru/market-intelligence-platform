@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Any, Protocol, runtime_checkable
 
 from services.ai.llm.guardrails import apply_guardrails
@@ -23,43 +24,73 @@ __all__ = [
     "OpenAIProvider",
 ]
 
-POSITIVE_HINTS = {
-    "surge",
-    "rally",
-    "gain",
-    "growth",
-    "upbeat",
-    "strong",
-    "bullish",
-    "beat",
-}
-NEGATIVE_HINTS = {
-    "drop",
-    "selloff",
-    "loss",
-    "weak",
-    "bearish",
-    "risk",
-    "lawsuit",
-    "hack",
-    "decline",
-}
+# Matched on whole words, never as substrings: "against" contains "gain",
+# "brisk" contains "risk", and "hackathon" contains "hack", so substring
+# matching scored ordinary prose at ±1.0 — enough to clear the alerting
+# service's critical-severity sentiment thresholds. Inflections are therefore
+# listed deliberately rather than picked up by accident.
+POSITIVE_HINTS = frozenset(
+    {
+        "surge",
+        "surges",
+        "surged",
+        "surging",
+        "rally",
+        "rallies",
+        "rallied",
+        "gain",
+        "gains",
+        "gained",
+        "growth",
+        "upbeat",
+        "strong",
+        "stronger",
+        "bullish",
+        "beat",
+        "beats",
+    }
+)
+NEGATIVE_HINTS = frozenset(
+    {
+        "drop",
+        "drops",
+        "dropped",
+        "selloff",
+        "selloffs",
+        "loss",
+        "losses",
+        "weak",
+        "weaker",
+        "bearish",
+        "risk",
+        "risks",
+        "risky",
+        "lawsuit",
+        "lawsuits",
+        "hack",
+        "hacks",
+        "hacked",
+        "decline",
+        "declines",
+        "declined",
+    }
+)
+SENTIMENT_LABELS = frozenset({"positive", "negative", "neutral"})
+_WORD_RE = re.compile(r"[a-z']+")
 
 
 @runtime_checkable
 class LLMProvider(Protocol):
     """Protocol for providers that generate structured market insight text."""
 
-    async def generate(self, request: GenerationRequest) -> GenerationResult:
-        ...
+    async def generate(self, request: GenerationRequest) -> GenerationResult: ...
 
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
     """Protocol for providers that embed text into float vectors."""
 
-    async def embed(self, request: EmbeddingRequest) -> EmbeddingResult:
-        ...
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResult: ...
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -145,9 +176,9 @@ def _message_payload(request: GenerationRequest) -> list[dict[str, str]]:
 
 
 def _fake_sentiment(text: str) -> float:
-    lowered = text.lower()
-    positive_hits = sum(word in lowered for word in POSITIVE_HINTS)
-    negative_hits = sum(word in lowered for word in NEGATIVE_HINTS)
+    words = set(_WORD_RE.findall(text.lower()))
+    positive_hits = len(POSITIVE_HINTS & words)
+    negative_hits = len(NEGATIVE_HINTS & words)
     score = (positive_hits - negative_hits) / max(1, positive_hits + negative_hits, 3)
     return round(_clamp(score, -1.0, 1.0), 3)
 
@@ -202,7 +233,11 @@ def _structured_from_payload(
     raw_text: str,
 ) -> GenerationResult:
     score = float(payload["sentiment_score"])
-    sentiment_label = payload.get("sentiment_label") or _normalize_label(score)
+    # The label is model-controlled text that ends up in Insight.sentiment_label
+    # and is interpolated into alert messages, so only the known vocabulary is
+    # accepted; anything else falls back to the score-derived label.
+    raw_label = str(payload.get("sentiment_label") or "").strip().lower()
+    sentiment_label = raw_label if raw_label in SENTIMENT_LABELS else _normalize_label(score)
     citations = tuple(str(citation) for citation in payload.get("citations", ()))
     return GenerationResult(
         summary=str(payload.get("summary", "")).strip(),
@@ -375,7 +410,7 @@ class OpenAIProvider(LLMProvider, EmbeddingProvider):
         if self._client is not None:
             return self._client
         try:
-            from openai import AsyncOpenAI  # type: ignore
+            from openai import AsyncOpenAI
         except ImportError as exc:
             raise RuntimeError(
                 "openai package is required for OpenAIProvider when no client is injected"

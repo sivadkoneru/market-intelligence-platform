@@ -4,21 +4,13 @@ FastAPI app for the AI-analysis service.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
-
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
 
-from libs.common import (
-    configure_logging,
-    configure_new_relic,
-    get_cache,
-    get_message_bus,
-    get_search_store,
-    get_settings,
-    install_observability,
+from libs.common import get_cache, get_message_bus, get_search_store
+from libs.common.service_app import (
+    bootstrap_service_logging,
+    create_service_app,
+    worker_lifespan,
 )
 from services.ai.llm import get_provider_bundle
 from services.ai.rag import RAGPipeline
@@ -46,60 +38,24 @@ def create_app(
     *,
     run_on_startup: bool = True,
 ) -> FastAPI:
-    settings = get_settings()
-    search_store = get_search_store(settings)
-    configure_logging(
-        level=settings.log_level,
-        service_name="ai",
-        search_store=search_store,
-        log_index=settings.elasticsearch_log_index,
-    )
-    configure_new_relic(settings, service_name="ai")
+    bootstrap_service_logging("ai")
     resolved_service = service or build_default_service()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        worker_task: asyncio.Task[object] | None = None
-        if run_on_startup:
-            worker_task = asyncio.create_task(resolved_service.run_forever())
-            app.state.ai_task = worker_task
-
-        try:
-            yield
-        finally:
-            if worker_task is not None and not worker_task.done():
-                worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await worker_task
-
-    app = FastAPI(
+    return create_service_app(
+        service_name="ai",
+        display_name="ai-analysis",
         title="Market Intelligence AI Analysis Service",
-        version="0.1.0",
-        description=(
-            "Portfolio service for offline-safe RAG market analysis. "
-            "No financial advice. No real trades."
+        summary="Portfolio service for offline-safe RAG market analysis.",
+        service=resolved_service,
+        state_attr="ai_service",
+        render_metrics=resolved_service.metrics.render,
+        lifespan=worker_lifespan(
+            resolved_service.run_forever if run_on_startup else None,
+            task_name="ai-worker",
+            state_attr="ai_task",
+            close=resolved_service.close,
         ),
-        lifespan=lifespan,
     )
-    app.state.ai_service = resolved_service
-    install_observability(app, service_name="ai", metrics=resolved_service.metrics)
-
-    @app.get("/")
-    async def root() -> dict[str, object]:
-        return {
-            "service": "ai-analysis",
-            "message": "Portfolio project only. No financial advice. No real trades.",
-        }
-
-    @app.get("/health")
-    async def health() -> dict[str, object]:
-        return await resolved_service.health()
-
-    @app.get("/metrics", response_class=PlainTextResponse)
-    async def metrics() -> str:
-        return resolved_service.metrics.render()
-
-    return app
 
 
 app = create_app()

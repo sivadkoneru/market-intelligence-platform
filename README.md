@@ -14,6 +14,7 @@ For the local test loop:
 ```bash
 task setup
 task lint
+task typecheck
 task test
 ```
 
@@ -81,13 +82,14 @@ The platform is runnable entirely offline with mock data. No real capital is at 
 
 ## Architecture
 
-See `docs/ARCHITECTURE.md` for system design, data flow diagrams, and component descriptions (when available).
+See `docs/ARCHITECTURE.md` for system design, data flow diagrams, and component descriptions.
 
 ## Commands
 
 ```bash
 task setup         # Create .venv with Python 3.11 and install dev dependencies
 task lint          # Ruff gate
+task typecheck     # Mypy gate
 task test          # Pytest gate
 task format        # Black + ruff format pass
 task up            # Build and start infra + app services
@@ -107,7 +109,8 @@ task clean         # Remove .venv and cache directories
 - **Messaging**: Azure Service Bus (with local emulator)
 - **Time-series**: Apache Druid
 - **Vector search**: Elasticsearch kNN
-- **Databases**: PostgreSQL, Redis
+- **Databases**: PostgreSQL (Druid metadata store), Redis
 - **LLM**: one OpenAI-compatible client (point `OPENAI_BASE_URL` at OpenAI, Azure OpenAI, Anthropic, or a local server), or MOCK_LLM (default)
 - **Linting/Formatting**: ruff, black
+- **Type checking**: mypy
 - **Testing**: pytest, pytest-asyncio

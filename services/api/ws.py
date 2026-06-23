@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from services.api.dependencies import get_api_service
 from services.api.service import APIService
@@ -14,9 +15,14 @@ from services.api.service import APIService
 router = APIRouter(tags=["stream"])
 
 
+MAX_SUBSCRIBED_SYMBOLS = 50
+
+
 class SubscribeRequest(BaseModel):
     action: str
-    symbols: list[str]
+    # Bounded: the set is retained per connection and checked on every fanout,
+    # so an unbounded list is free memory and CPU for any client that asks.
+    symbols: list[str] = Field(max_length=MAX_SUBSCRIBED_SYMBOLS)
 
 
 async def _receive_commands(
@@ -26,15 +32,19 @@ async def _receive_commands(
     outbound: asyncio.Queue[dict[str, object]],
 ) -> None:
     while True:
-        payload = await websocket.receive_json()
+        # receive_json() itself raises on a non-JSON text frame (JSONDecodeError)
+        # and on a binary frame (KeyError), so it has to sit inside the guard —
+        # otherwise a one-byte frame kills the connection with a traceback
+        # instead of the error frame this loop is built to send.
         try:
+            payload = await websocket.receive_json()
             request = SubscribeRequest.model_validate(payload)
             if request.action != "subscribe":
                 raise ValueError("action must be 'subscribe'")
             symbols = service.subscribe_stream(connection_id, request.symbols)
             if not symbols:
                 raise ValueError("symbols must contain at least one non-empty symbol")
-        except (ValidationError, ValueError) as exc:
+        except (ValidationError, ValueError, KeyError, TypeError) as exc:
             await outbound.put({"type": "error", "detail": str(exc)})
             continue
 
@@ -85,7 +95,7 @@ async def websocket_stream(
     finally:
         service.unregister_stream(connection_id)
         command_task.cancel()
-        tasks = [command_task]
+        tasks: list[asyncio.Task[Any]] = [command_task]
         if outbound_task is not None and not outbound_task.done():
             outbound_task.cancel()
             tasks.append(outbound_task)

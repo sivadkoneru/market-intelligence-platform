@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 from tenacity import RetryError
 
 from libs.common import (
+    IDEMPOTENCY_TTL_SECONDS,
     TOPIC_ALERTS,
     TOPIC_INSIGHTS,
     TOPIC_SIGNALS,
@@ -17,13 +17,18 @@ from libs.common import (
     Cache,
     CircuitBreaker,
     CircuitOpenError,
-    HTTPMetrics,
     Insight,
     MessageBus,
     ReceivedMessage,
     Signal,
+    WorkerMetrics,
+    close_backends,
+    dead_letter_message,
     get_logger,
+    render_counters,
     retry_async,
+    run_poll_loop,
+    validation_reason,
 )
 from services.alerting.rules import RuleEngine
 
@@ -46,7 +51,7 @@ def alert_published_key(dedupe_key: str) -> str:
 
 
 @dataclass
-class AlertingMetrics:
+class AlertingMetrics(WorkerMetrics):
     messages_seen: int = 0
     messages_processed: int = 0
     duplicates_suppressed: int = 0
@@ -54,45 +59,20 @@ class AlertingMetrics:
     processing_retries: int = 0
     circuit_open_rejections: int = 0
     dead_lettered: int = 0
-    last_error: str | None = None
-    http: HTTPMetrics = field(default_factory=HTTPMetrics)
-
-    def record_http_request(
-        self,
-        *,
-        method: str,
-        path: str,
-        status_code: int,
-        duration_ms: float,
-        trace_context_provided: bool,
-        correlation_context_provided: bool,
-    ) -> None:
-        self.http.record_http_request(
-            method=method,
-            path=path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-            trace_context_provided=trace_context_provided,
-            correlation_context_provided=correlation_context_provided,
-        )
 
     def render(self) -> str:
-        lines = [
-            "# TYPE alerting_messages_seen counter",
-            f"alerting_messages_seen {self.messages_seen}",
-            "# TYPE alerting_messages_processed counter",
-            f"alerting_messages_processed {self.messages_processed}",
-            "# TYPE alerting_duplicates_suppressed counter",
-            f"alerting_duplicates_suppressed {self.duplicates_suppressed}",
-            "# TYPE alerting_alerts_published counter",
-            f"alerting_alerts_published {self.alerts_published}",
-            "# TYPE alerting_processing_retries counter",
-            f"alerting_processing_retries {self.processing_retries}",
-            "# TYPE alerting_circuit_open_rejections counter",
-            f"alerting_circuit_open_rejections {self.circuit_open_rejections}",
-            "# TYPE alerting_dead_lettered counter",
-            f"alerting_dead_lettered {self.dead_lettered}",
-        ]
+        lines = render_counters(
+            "alerting",
+            {
+                "messages_seen": self.messages_seen,
+                "messages_processed": self.messages_processed,
+                "duplicates_suppressed": self.duplicates_suppressed,
+                "alerts_published": self.alerts_published,
+                "processing_retries": self.processing_retries,
+                "circuit_open_rejections": self.circuit_open_rejections,
+                "dead_lettered": self.dead_lettered,
+            },
+        )
         lines.extend(self.http.render("alerting"))
         return "\n".join(lines) + "\n"
 
@@ -147,10 +127,22 @@ class AlertingService:
         poll_interval_seconds: float = 0.25,
         max_messages: int = 10,
     ) -> None:
-        while True:
-            processed = await self.poll_once(max_messages=max_messages)
-            if processed == 0:
-                await asyncio.sleep(poll_interval_seconds)
+        await run_poll_loop(
+            self.poll_once,
+            service_name="alerting",
+            log=self._log,
+            metrics=self.metrics,
+            poll_interval_seconds=poll_interval_seconds,
+            max_messages=max_messages,
+        )
+
+    async def close(self) -> None:
+        """Release every backend that owns a connection."""
+        await close_backends(
+            (self._cache, self._bus),
+            log=self._log,
+            service_name="alerting",
+        )
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -177,7 +169,7 @@ class AlertingService:
         try:
             signal = Signal.model_validate(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"invalid signal payload: {exc.errors()}")
+            await self._dead_letter(message, validation_reason("invalid signal payload", exc))
             return
         await self._process_event(
             message=message,
@@ -190,7 +182,7 @@ class AlertingService:
         try:
             insight = Insight.model_validate(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"invalid insight payload: {exc.errors()}")
+            await self._dead_letter(message, validation_reason("invalid insight payload", exc))
             return
         await self._process_event(
             message=message,
@@ -289,8 +281,8 @@ class AlertingService:
                     message_id=alert.dedupe_key,
                     correlation_id=alert.correlation_id,
                 )
-                await self._cache.set(published_key, True)
-            await self._cache.set(processed_key, True)
+                await self._cache.set(published_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
+            await self._cache.set(processed_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
 
         try:
             await retry_async(
@@ -300,19 +292,20 @@ class AlertingService:
                 wait_max=self._retry_wait_max_seconds,
             )
         except RetryError as exc:
+            # Surface the operation's own failure rather than tenacity's
+            # wrapper, but keep the RetryError as the explicit cause so the
+            # traceback still shows the attempts were exhausted.
             last_exc = exc.last_attempt.exception()
             if last_exc is None:
                 raise
-            raise last_exc
+            raise last_exc from exc
 
     async def _dead_letter(self, message: ReceivedMessage, reason: str) -> None:
-        self.metrics.dead_lettered += 1
-        self.metrics.last_error = reason
-        await self._bus.dead_letter(message, reason=reason)
-        self._log.warning(
-            "alerting.dead_lettered",
-            topic=message.topic,
-            subscription=message.subscription,
-            message_id=message.message_id,
-            reason=reason,
+        await dead_letter_message(
+            message,
+            reason,
+            bus=self._bus,
+            log=self._log,
+            metrics=self.metrics,
+            service_name="alerting",
         )

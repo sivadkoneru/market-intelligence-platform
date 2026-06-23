@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Optional
+from typing import Any
 
 from pydantic_settings import BaseSettings
 
 
-def _dotenv_path() -> Optional[str]:
+def _dotenv_path() -> str | None:
     """
     Resolve the dotenv file the settings load from.
 
@@ -38,9 +38,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     druid_url: str = "http://localhost:8888"
     elasticsearch_url: str = "http://localhost:9200"
-    postgres_dsn: str = (
-        "postgresql+asyncpg://market_intel:market_intel@localhost:5432/market_intel"
-    )
+    postgres_dsn: str = "postgresql+asyncpg://market_intel:market_intel@localhost:5432/market_intel"
 
     # -------------------------------------------------------------------------
     # LLM / AI provider (offline mock by default; one OpenAI-compatible client
@@ -48,19 +46,19 @@ class Settings(BaseSettings):
     # server, or any other OpenAI-compatible endpoint).
     # -------------------------------------------------------------------------
     mock_llm: bool = True
-    openai_api_key: Optional[str] = None
-    openai_base_url: Optional[str] = None
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
     openai_chat_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 
     # -------------------------------------------------------------------------
     # Observability
     # -------------------------------------------------------------------------
-    new_relic_license_key: Optional[str] = None
-    new_relic_config_file: Optional[str] = None
-    new_relic_app_name: Optional[str] = None
-    new_relic_environment: Optional[str] = None
-    elasticsearch_log_index: Optional[str] = None
+    new_relic_license_key: str | None = None
+    new_relic_config_file: str | None = None
+    new_relic_app_name: str | None = None
+    new_relic_environment: str | None = None
+    elasticsearch_log_index: str | None = None
 
     # -------------------------------------------------------------------------
     # Service identity / logging
@@ -80,3 +78,30 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the cached singleton Settings instance."""
     return Settings()
+
+
+def resolve_settings(settings: Any = None) -> Settings:
+    """
+    Return *settings*, falling back to the cached singleton.
+
+    Every port factory takes an optional settings object so tests can inject
+    one; this is the shared "use what I was given, else the process default"
+    step they all opened with.
+    """
+    if settings is None:
+        return get_settings()
+    return settings
+
+
+def is_default(field_name: str, value: Any) -> bool:
+    """
+    Report whether *value* is the shipped default for ``Settings.<field_name>``.
+
+    The port factories choose between a fake and a real client by asking "is
+    this still the placeholder?". Comparing against the field's declared default
+    keeps that decision tied to the one place the default is written. Repeating
+    the literal in each factory meant changing a default here — a port, a host —
+    silently flipped that factory into constructing a *real* client against an
+    address nobody configured.
+    """
+    return value == Settings.model_fields[field_name].default

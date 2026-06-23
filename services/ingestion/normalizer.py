@@ -14,6 +14,7 @@ from typing import Any
 from libs.common import MarketEvent
 
 _BINANCE_TRADE_EVENT = "trade"
+_BINANCE_TICKER_EVENT = "24hrTicker"
 _COINBASE_TICKER_EVENT = "ticker"
 
 
@@ -58,16 +59,27 @@ def normalize_market_payload(
             trace_id=payload.get("trace_id"),
         )
 
-    if payload.get("e") in {_BINANCE_TRADE_EVENT, "24hrTicker"}:
-        event_type = "trade" if payload.get("e") == _BINANCE_TRADE_EVENT else "ticker"
+    if payload.get("e") in {_BINANCE_TRADE_EVENT, _BINANCE_TICKER_EVENT}:
+        is_trade = payload.get("e") == _BINANCE_TRADE_EVENT
         event_ts = payload.get("T", payload.get("E"))
         symbol = str(payload["s"]).upper()
+        # Binance reuses field letters across streams: on a `trade` frame `p` is
+        # the trade price and `q` the base quantity, but on `24hrTicker` `p` is
+        # the 24h price *change* (often negative) and `q` the quote volume, with
+        # the last price in `c` and the base volume in `v`. Picking by presence
+        # rather than by stream published price changes as prices.
+        if is_trade:
+            price = float(payload["p"])
+            volume = _optional_float(payload.get("q"))
+        else:
+            price = float(payload["c"])
+            volume = _optional_float(payload.get("v"))
         return MarketEvent(
             symbol=symbol,
             source=source_override or "binance",
-            event_type=event_type,
-            price=float(payload.get("p") or payload.get("c")),
-            volume=_optional_float(payload.get("q") or payload.get("v")),
+            event_type="trade" if is_trade else "ticker",
+            price=price,
+            volume=volume,
             bid=_optional_float(payload.get("b")),
             ask=_optional_float(payload.get("a")),
             ts=_coerce_datetime(float(event_ts) / 1000.0),

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from libs.common import TOPIC_MARKET_RAW, InMemoryBus
+from libs.common import TOPIC_MARKET_RAW, InMemoryBus, ReceivedMessage
 from scripts import seed_market_data
 from services.stream.service import STREAM_SUBSCRIPTION
 
@@ -50,7 +50,7 @@ def test_publish_seed_data_publishes_market_raw_events_and_logs(monkeypatch) -> 
     bus = InMemoryBus()
     fake_logger = _FakeLogger()
 
-    async def run() -> list[object]:
+    async def run() -> tuple[list[str], list[ReceivedMessage]]:
         await bus.receive(TOPIC_MARKET_RAW, STREAM_SUBSCRIPTION, max_messages=0)
         monkeypatch.setattr(seed_market_data, "get_message_bus", lambda settings=None: bus)
         monkeypatch.setattr(seed_market_data, "get_logger", lambda name: fake_logger)
@@ -69,7 +69,7 @@ def test_publish_seed_data_publishes_market_raw_events_and_logs(monkeypatch) -> 
             allow_offline=True,
         )
         messages = await bus.peek(TOPIC_MARKET_RAW, STREAM_SUBSCRIPTION, n=5)
-        return [symbols, messages]
+        return symbols, messages
 
     symbols, messages = asyncio.run(run())
 

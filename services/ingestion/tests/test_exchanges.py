@@ -216,14 +216,20 @@ async def test_coinbase_client_sends_subscribe_and_tracks_staleness() -> None:
     }
     assert state.last_message_at == base_time + timedelta(seconds=2)
     assert state.last_heartbeat_at == base_time + timedelta(seconds=1)
-    assert client.is_stale(
-        stale_after_seconds=5,
-        now=base_time + timedelta(seconds=6),
-    ) is False
-    assert client.is_stale(
-        stale_after_seconds=5,
-        now=base_time + timedelta(seconds=8),
-    ) is True
+    assert (
+        client.is_stale(
+            stale_after_seconds=5,
+            now=base_time + timedelta(seconds=6),
+        )
+        is False
+    )
+    assert (
+        client.is_stale(
+            stale_after_seconds=5,
+            now=base_time + timedelta(seconds=8),
+        )
+        is True
+    )
     assert len(published) == 1
     assert published[0].body["symbol"] == "BTCUSD"
 
@@ -318,9 +324,7 @@ async def test_duplicate_exchange_events_are_suppressed_on_market_raw() -> None:
     }
     client = BinanceWebSocketClient(
         bus=bus,
-        connect_factory=SequenceConnectFactory(
-            [FakeWebSocket([duplicate_trade, duplicate_trade])]
-        ),
+        connect_factory=SequenceConnectFactory([FakeWebSocket([duplicate_trade, duplicate_trade])]),
         reconnect_backoff_seconds=0,
     )
 
@@ -351,3 +355,154 @@ async def test_exchange_client_opens_circuit_after_repeated_failures() -> None:
     assert client.state.connect_failures == 2
     assert client.state.reconnects == 2
     assert client.state.last_error == "circuit open"
+
+
+class ProtocolWebSocket:
+    """
+    An open connection with NO ``__aenter__`` — what ``await websockets.connect``
+    actually returns on the pinned ``websockets==13.1``.
+    """
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        self._messages = deque(json.dumps(message) for message in messages)
+        self.sent_messages: list[str] = []
+        self.closed = False
+
+    def __aiter__(self) -> "ProtocolWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.popleft()
+
+    async def send(self, data: str) -> None:
+        self.sent_messages.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ConnectLikeFactory:
+    """
+    Mirrors ``websockets.connect``: the returned object is BOTH awaitable and an
+    async context manager, and awaiting it yields a bare protocol.
+    """
+
+    class _Connect:
+        def __init__(self, protocol: ProtocolWebSocket) -> None:
+            self._protocol = protocol
+
+        def __await__(self):
+            async def _resolve() -> ProtocolWebSocket:
+                return self._protocol
+
+            return _resolve().__await__()
+
+        async def __aenter__(self) -> ProtocolWebSocket:
+            return self._protocol
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            await self._protocol.close()
+
+    def __init__(self, protocol: ProtocolWebSocket) -> None:
+        self._protocol = protocol
+        self.calls: list[str] = []
+
+    def __call__(self, url: str) -> "_Connect":
+        self.calls.append(url)
+        return ConnectLikeFactory._Connect(self._protocol)
+
+
+@pytest.mark.asyncio
+async def test_client_connects_through_a_websockets_style_connect_object() -> None:
+    """The real ``websockets.connect`` shape must work, not just test doubles."""
+    bus = InMemoryBus()
+    await bus.receive(TOPIC_MARKET_RAW, "stream", max_messages=1)
+    protocol = ProtocolWebSocket(
+        [{"e": "trade", "s": "BTCUSDT", "p": "42100.5", "q": "0.25", "T": 1704067200000}]
+    )
+    client = BinanceWebSocketClient(
+        bus=bus,
+        connect_factory=ConnectLikeFactory(protocol),
+        reconnect_backoff_seconds=0,
+    )
+
+    state = await client.run(max_messages=1)
+    published = await bus.peek(TOPIC_MARKET_RAW, "stream", n=10)
+
+    assert state.events_published == 1
+    assert published[0].body["price"] == 42100.5
+    assert protocol.closed is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_frame_is_skipped_without_dropping_the_connection() -> None:
+    bus = InMemoryBus()
+    await bus.receive(TOPIC_MARKET_RAW, "stream", max_messages=1)
+    websocket = FakeWebSocket(
+        [
+            {"e": "error", "msg": "rate limited"},
+            {"e": "trade", "s": "BTCUSDT", "p": "42100.5", "q": "0.25", "T": 1704067200000},
+        ]
+    )
+    connect_factory = SequenceConnectFactory([websocket])
+    client = BinanceWebSocketClient(
+        bus=bus,
+        connect_factory=connect_factory,
+        reconnect_backoff_seconds=0,
+    )
+
+    state = await client.run(max_messages=1)
+
+    assert len(connect_factory.calls) == 1, "the socket must not have been torn down"
+    assert state.malformed_messages == 1
+    assert state.events_published == 1
+
+
+@pytest.mark.asyncio
+async def test_reconnect_budget_resets_after_a_productive_connection() -> None:
+    """A blip days after an earlier one must not exhaust a lifetime budget."""
+    bus = InMemoryBus()
+    await bus.receive(TOPIC_MARKET_RAW, "stream", max_messages=1)
+    trade = {"e": "trade", "s": "BTCUSDT", "p": "42100.5", "q": "0.25", "T": 1704067200000}
+    connect_factory = SequenceConnectFactory(
+        [
+            ConnectionError("blip one"),
+            FakeWebSocket([trade]),
+            ConnectionError("blip two"),
+            FakeWebSocket([{**trade, "T": 1704067201000}]),
+        ]
+    )
+    client = BinanceWebSocketClient(
+        bus=bus,
+        connect_factory=connect_factory,
+        reconnect_backoff_seconds=0,
+        max_reconnects=1,
+    )
+
+    state = await client.run(max_messages=2)
+
+    assert len(connect_factory.calls) == 4
+    assert state.events_published == 2
+
+
+def test_is_stale_uses_the_most_recent_signal_of_life() -> None:
+    from services.ingestion.exchanges.base import ExchangeStreamState
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    state = ExchangeStreamState()
+    state.mark_heartbeat(start)
+    state.mark_message(start + timedelta(seconds=99))
+
+    assert state.is_stale(stale_after_seconds=30, now=start + timedelta(seconds=100)) is False
+
+
+def test_is_stale_when_every_signal_is_old() -> None:
+    from services.ingestion.exchanges.base import ExchangeStreamState
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    state = ExchangeStreamState()
+    state.mark_message(start)
+
+    assert state.is_stale(stale_after_seconds=30, now=start + timedelta(seconds=31)) is True

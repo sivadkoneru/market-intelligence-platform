@@ -8,24 +8,31 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 
 from libs.common import (
+    IDEMPOTENCY_TTL_SECONDS,
+    INSIGHT_CACHE_PREFIX,
     TOPIC_INSIGHTS,
     TOPIC_NEWS_RAW,
     TOPIC_SIGNALS,
     Cache,
-    HTTPMetrics,
     Insight,
     MessageBus,
     NewsEvent,
     ReceivedMessage,
     SearchStore,
     Signal,
+    WorkerMetrics,
+    close_backends,
+    dead_letter_message,
     get_logger,
+    render_counters,
+    run_poll_loop,
+    validation_reason,
 )
 from services.ai.llm import (
     GenerationRequest,
@@ -39,7 +46,6 @@ from services.ai.rag import RAGPipeline, SourceDocument
 AI_SUBSCRIPTION = "ai"
 PROCESSED_PREFIX = "ai-analysis:processed"
 LLM_CACHE_PREFIX = "ai-analysis:llm"
-INSIGHT_CACHE_PREFIX = "insight"
 
 
 def _stable_hash(payload: dict[str, Any]) -> str:
@@ -142,7 +148,7 @@ class AutoGenCompatibleEventDetector:
     def __init__(self) -> None:
         self._fallback = DeterministicEventDetector()
         try:
-            import autogen  # type: ignore  # noqa: F401
+            import autogen  # noqa: F401
 
             self._mode = "autogen"
         except ImportError:
@@ -177,7 +183,7 @@ class AutoGenCompatibleEventDetector:
 
 
 @dataclass
-class AIMetrics:
+class AIMetrics(WorkerMetrics):
     messages_seen: int = 0
     messages_processed: int = 0
     duplicates_suppressed: int = 0
@@ -187,49 +193,22 @@ class AIMetrics:
     news_indexed: int = 0
     signal_contexts_indexed: int = 0
     dead_lettered: int = 0
-    last_error: str | None = None
-    http: HTTPMetrics = field(default_factory=HTTPMetrics)
-
-    def record_http_request(
-        self,
-        *,
-        method: str,
-        path: str,
-        status_code: int,
-        duration_ms: float,
-        trace_context_provided: bool,
-        correlation_context_provided: bool,
-    ) -> None:
-        self.http.record_http_request(
-            method=method,
-            path=path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-            trace_context_provided=trace_context_provided,
-            correlation_context_provided=correlation_context_provided,
-        )
 
     def render(self) -> str:
-        lines = [
-            "# TYPE ai_messages_seen counter",
-            f"ai_messages_seen {self.messages_seen}",
-            "# TYPE ai_messages_processed counter",
-            f"ai_messages_processed {self.messages_processed}",
-            "# TYPE ai_duplicates_suppressed counter",
-            f"ai_duplicates_suppressed {self.duplicates_suppressed}",
-            "# TYPE ai_insights_published counter",
-            f"ai_insights_published {self.insights_published}",
-            "# TYPE ai_llm_cache_hits counter",
-            f"ai_llm_cache_hits {self.llm_cache_hits}",
-            "# TYPE ai_processing_retries counter",
-            f"ai_processing_retries {self.processing_retries}",
-            "# TYPE ai_news_indexed counter",
-            f"ai_news_indexed {self.news_indexed}",
-            "# TYPE ai_signal_contexts_indexed counter",
-            f"ai_signal_contexts_indexed {self.signal_contexts_indexed}",
-            "# TYPE ai_dead_lettered counter",
-            f"ai_dead_lettered {self.dead_lettered}",
-        ]
+        lines = render_counters(
+            "ai",
+            {
+                "messages_seen": self.messages_seen,
+                "messages_processed": self.messages_processed,
+                "duplicates_suppressed": self.duplicates_suppressed,
+                "insights_published": self.insights_published,
+                "llm_cache_hits": self.llm_cache_hits,
+                "processing_retries": self.processing_retries,
+                "news_indexed": self.news_indexed,
+                "signal_contexts_indexed": self.signal_contexts_indexed,
+                "dead_lettered": self.dead_lettered,
+            },
+        )
         lines.extend(self.http.render("ai"))
         return "\n".join(lines) + "\n"
 
@@ -286,22 +265,28 @@ class AIAnalysisService:
         poll_interval_seconds: float = 0.25,
         max_messages: int = 10,
     ) -> None:
-        while True:
-            try:
-                processed = await self.poll_once(max_messages=max_messages)
-            except Exception as exc:
-                self.metrics.last_error = (
-                    f"ai polling failed: {type(exc).__name__}: {exc}"
-                )
-                self._log.warning(
-                    "ai.poll_failed",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
-                await asyncio.sleep(poll_interval_seconds)
-                continue
-            if processed == 0:
-                await asyncio.sleep(poll_interval_seconds)
+        await run_poll_loop(
+            self.poll_once,
+            service_name="ai",
+            log=self._log,
+            metrics=self.metrics,
+            poll_interval_seconds=poll_interval_seconds,
+            max_messages=max_messages,
+        )
+
+    async def close(self) -> None:
+        """
+        Release every backend that owns a connection.
+
+        This service was the only one that never closed its clients, so each
+        restart leaked the Elasticsearch, Redis, and Service Bus sockets built
+        by ``build_default_service``.
+        """
+        await close_backends(
+            (self._search_store, self._cache, self._bus, self._llm),
+            log=self._log,
+            service_name="ai",
+        )
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -327,7 +312,7 @@ class AIAnalysisService:
         try:
             event = NewsEvent.model_validate(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"invalid news event payload: {exc.errors()}")
+            await self._dead_letter(message, validation_reason("invalid news event payload", exc))
             return
 
         await self._process_with_retries(
@@ -339,7 +324,7 @@ class AIAnalysisService:
         try:
             signal = Signal.model_validate(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"invalid signal payload: {exc.errors()}")
+            await self._dead_letter(message, validation_reason("invalid signal payload", exc))
             return
 
         await self._process_with_retries(
@@ -357,9 +342,7 @@ class AIAnalysisService:
                 await operation()
                 return
             except Exception as exc:
-                self.metrics.last_error = (
-                    f"ai analysis failed: {type(exc).__name__}: {exc}"
-                )
+                self.metrics.last_error = f"ai analysis failed: {type(exc).__name__}: {exc}"
                 if attempt >= self._max_processing_attempts:
                     await self._dead_letter(message, self.metrics.last_error)
                     return
@@ -458,7 +441,7 @@ class AIAnalysisService:
             f"{INSIGHT_CACHE_PREFIX}:{symbol}",
             insight.model_dump(mode="json"),
         )
-        await self._cache.set(processed_key, True)
+        await self._cache.set(processed_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
 
     async def _publish_signal_insight(self, signal: Signal) -> None:
         content_hash = signal_content_hash(signal)
@@ -492,7 +475,7 @@ class AIAnalysisService:
             f"{INSIGHT_CACHE_PREFIX}:{signal.symbol}",
             insight.model_dump(mode="json"),
         )
-        await self._cache.set(processed_key, True)
+        await self._cache.set(processed_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
 
     async def _generate_with_cache(
         self,
@@ -524,7 +507,11 @@ class AIAnalysisService:
 
         result = await self._llm.generate(request)
         guarded, _ = apply_guardrails(request, result)
-        await self._cache.set(cache_key, _generation_result_payload(guarded))
+        # Bounded for the same reason as the processed markers: one key per
+        # unique generation, retained forever, is unbounded store growth.
+        await self._cache.set(
+            cache_key, _generation_result_payload(guarded), ttl=IDEMPOTENCY_TTL_SECONDS
+        )
         return guarded
 
     async def _publish_insight(self, insight: Insight, *, message_id: str) -> None:
@@ -544,15 +531,13 @@ class AIAnalysisService:
         )
 
     async def _dead_letter(self, message: ReceivedMessage, reason: str) -> None:
-        self.metrics.dead_lettered += 1
-        self.metrics.last_error = reason
-        await self._bus.dead_letter(message, reason=reason)
-        self._log.warning(
-            "ai.dead_lettered",
-            topic=message.topic,
-            subscription=message.subscription,
-            message_id=message.message_id,
-            reason=reason,
+        await dead_letter_message(
+            message,
+            reason,
+            bus=self._bus,
+            log=self._log,
+            metrics=self.metrics,
+            service_name="ai",
         )
 
 
@@ -637,10 +622,7 @@ def _signal_context_text(signal: Signal) -> str:
 def _signal_query(signal: Signal) -> str:
     trend = signal.indicators.get("trend")
     rsi = signal.indicators.get("rsi")
-    return (
-        f"{signal.symbol} technical signal anomaly {signal.anomaly} "
-        f"trend {trend} rsi {rsi}"
-    )
+    return f"{signal.symbol} technical signal anomaly {signal.anomaly} " f"trend {trend} rsi {rsi}"
 
 
 def _news_prompt(

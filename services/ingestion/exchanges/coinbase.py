@@ -36,9 +36,7 @@ class CoinbaseWebSocketClient(ExchangeWebSocketClient):
         sleep_fn: SleepFn | None = None,
         time_fn: TimeFn | None = None,
     ) -> None:
-        self._product_ids = [
-            self._normalize_product_id(product_id) for product_id in product_ids
-        ]
+        self._product_ids = [self._normalize_product_id(product_id) for product_id in product_ids]
         super().__init__(
             bus=bus,
             connect_factory=connect_factory or websockets.connect,

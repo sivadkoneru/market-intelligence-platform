@@ -16,13 +16,6 @@ def test_fastapi_import():
     assert hasattr(fastapi, "FastAPI")
 
 
-def test_pandas_import():
-    """Test pandas is installed."""
-    import pandas
-
-    assert hasattr(pandas, "DataFrame")
-
-
 def test_numpy_import():
     """Test numpy is installed."""
     import numpy
@@ -65,13 +58,6 @@ def test_azure_servicebus_import():
     assert hasattr(azure.servicebus, "ServiceBusClient")
 
 
-def test_sqlalchemy_import():
-    """Test sqlalchemy is installed."""
-    import sqlalchemy
-
-    assert hasattr(sqlalchemy, "create_engine")
-
-
 def test_httpx_import():
     """Test httpx is installed."""
     import httpx
@@ -100,25 +86,11 @@ def test_pydantic_settings_import():
     assert BaseSettings is not None
 
 
-def test_asyncpg_import():
-    """Test asyncpg is installed."""
-    import asyncpg
-
-    assert hasattr(asyncpg, "connect")
-
-
 def test_python_dateutil_import():
     """Test python_dateutil is installed."""
     from dateutil import parser
 
     assert hasattr(parser, "parse")
-
-
-def test_orjson_import():
-    """Test orjson is installed."""
-    import orjson
-
-    assert hasattr(orjson, "dumps")
 
 
 def test_uvicorn_import():
@@ -128,17 +100,29 @@ def test_uvicorn_import():
     assert hasattr(uvicorn, "run")
 
 
-def test_ruff_available():
-    """Test ruff is available in venv."""
-    import subprocess
+def _run_tool(name: str):
+    """
+    Invoke a dev tool next to the running interpreter.
 
-    result = subprocess.run([".venv/bin/ruff", "--version"], capture_output=True, text=True)
+    Hard-coding ".venv/bin/<tool>" made these tests depend on the working
+    directory, so they failed when pytest was invoked from anywhere but the
+    repo root.
+    """
+    import pathlib
+    import subprocess
+    import sys
+
+    executable = pathlib.Path(sys.executable).parent / name
+    return subprocess.run([str(executable), "--version"], capture_output=True, text=True)
+
+
+def test_ruff_available():
+    """Test ruff is available alongside the running interpreter."""
+    result = _run_tool("ruff")
     assert result.returncode == 0, f"ruff not available: {result.stderr}"
 
 
 def test_black_available():
-    """Test black is available in venv."""
-    import subprocess
-
-    result = subprocess.run([".venv/bin/black", "--version"], capture_output=True, text=True)
+    """Test black is available alongside the running interpreter."""
+    result = _run_tool("black")
     assert result.returncode == 0, f"black not available: {result.stderr}"

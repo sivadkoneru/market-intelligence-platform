@@ -1,6 +1,7 @@
 """Tests for libs.common.bus — InMemoryBus, ServiceBusBus settlement, and factory."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -362,9 +363,7 @@ async def test_servicebus_receive_decodes_sectioned_body():
     assert len(messages) == 1
     assert messages[0].body == {"v": 1}
     assert messages[0]._queue_ref.raw is raw
-    assert fake_client.receiver_calls == [
-        {"topic_name": "topic", "subscription_name": "sub"}
-    ]
+    assert fake_client.receiver_calls == [{"topic_name": "topic", "subscription_name": "sub"}]
 
 
 @pytest.mark.asyncio
@@ -379,9 +378,7 @@ async def test_servicebus_peek_decodes_sectioned_body():
 
     assert len(messages) == 1
     assert messages[0].body == {"peek": True}
-    assert fake_client.receiver_calls == [
-        {"topic_name": "topic", "subscription_name": "sub"}
-    ]
+    assert fake_client.receiver_calls == [{"topic_name": "topic", "subscription_name": "sub"}]
 
 
 @pytest.mark.asyncio
@@ -426,3 +423,78 @@ async def test_servicebus_dead_letter_noop_when_no_queue_ref():
     bus, _ = _make_servicebus_bus_with_fake_receiver("t", "s")
     msg = ReceivedMessage(topic="t", subscription="s", body={}, message_id="x", _queue_ref=None)
     await bus.dead_letter(msg, reason="irrelevant")  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# ServiceBusBus — sender lifecycle (no live infra)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSender:
+    def __init__(self, topic: str) -> None:
+        self.topic = topic
+        self.sent: list[object] = []
+        self.closed = False
+
+    async def send_messages(self, message) -> None:
+        self.sent.append(message)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSenderOnlyClient:
+    def __init__(self) -> None:
+        self.senders: list[_FakeSender] = []
+        self.closed = False
+
+    def get_topic_sender(self, topic_name: str) -> _FakeSender:
+        sender = _FakeSender(topic_name)
+        self.senders.append(sender)
+        return sender
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _bus_with_fake_client() -> tuple[ServiceBusBus, _FakeSenderOnlyClient]:
+    bus = object.__new__(ServiceBusBus)
+    client = _FakeSenderOnlyClient()
+    bus._client = cast(Any, client)
+    bus._senders = {}
+    bus._receivers = {}
+    return bus, client
+
+
+@pytest.mark.asyncio
+async def test_publish_reuses_one_sender_per_topic():
+    """Publishing is per-tick; a sender per message opens an AMQP link each time."""
+    bus, client = _bus_with_fake_client()
+
+    for index in range(5):
+        await bus.publish("market.raw", {"symbol": "BTCUSDT", "seq": index})
+
+    assert len(client.senders) == 1
+    assert len(client.senders[0].sent) == 5
+
+
+@pytest.mark.asyncio
+async def test_publish_uses_a_separate_sender_per_topic():
+    bus, client = _bus_with_fake_client()
+
+    await bus.publish("market.raw", {"symbol": "BTCUSDT"})
+    await bus.publish("signals", {"symbol": "BTCUSDT"})
+
+    assert sorted(sender.topic for sender in client.senders) == ["market.raw", "signals"]
+
+
+@pytest.mark.asyncio
+async def test_close_releases_cached_senders_and_the_client():
+    bus, client = _bus_with_fake_client()
+    await bus.publish("market.raw", {"symbol": "BTCUSDT"})
+
+    await bus.close()
+
+    assert client.senders[0].closed is True
+    assert client.closed is True
+    assert bus._senders == {}

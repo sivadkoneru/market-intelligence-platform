@@ -7,11 +7,10 @@ All services import from this module — do NOT define per-service duplicate mod
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # ---------------------------------------------------------------------------
 # Topic constants
@@ -23,6 +22,9 @@ TOPIC_SIGNALS: str = "signals"
 TOPIC_INSIGHTS: str = "insights"
 TOPIC_ALERTS: str = "alerts"
 
+# Cross-service cache-key prefix: the AI service writes it, the API reads it.
+INSIGHT_CACHE_PREFIX: str = "insight"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,7 +32,7 @@ TOPIC_ALERTS: str = "alerts"
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _uuid4_str() -> str:
@@ -47,8 +49,8 @@ class EventBase(BaseModel):
 
     event_id: str = Field(default_factory=_uuid4_str)
     ts: datetime = Field(default_factory=_utcnow)
-    correlation_id: Optional[str] = None
-    trace_id: Optional[str] = None
+    correlation_id: str | None = None
+    trace_id: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -65,9 +67,9 @@ class MarketEvent(EventBase):
     source: str
     event_type: str  # "trade" | "ticker"
     price: float
-    volume: Optional[float] = None
-    bid: Optional[float] = None
-    ask: Optional[float] = None
+    volume: float | None = None
+    bid: float | None = None
+    ask: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +83,9 @@ class NewsEvent(EventBase):
     source: str
     title: str
     body: str
-    url: Optional[str] = None
+    url: str | None = None
     symbols: list[str]
-    author: Optional[str] = None
+    author: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +98,7 @@ class Signal(EventBase):
 
     symbol: str
     source: str = "stream"
-    indicators: dict[str, Optional[float]]
+    indicators: dict[str, float | None]
     anomaly: bool = False
 
 
@@ -148,3 +150,26 @@ def market_event_key(symbol: str, ts: datetime, source: str) -> str:
     """
     raw = f"{symbol}:{ts.isoformat()}:{source}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter reason formatting
+# ---------------------------------------------------------------------------
+
+MAX_DEAD_LETTER_REASON_CHARS = 512
+
+
+def validation_reason(prefix: str, exc: ValidationError) -> str:
+    """
+    Build a bounded dead-letter reason for a rejected event payload.
+
+    ``ValidationError.errors()`` embeds the offending *input*, so a large or
+    hostile payload produces a megabyte-scale reason. That overruns the Azure
+    Service Bus DeadLetterReason limit — making the dead-letter call itself
+    fail and aborting the rest of the batch — and mirrors the whole payload
+    into the log sink. The input is dropped and the detail is capped.
+    """
+    detail = str(exc.errors(include_input=False, include_url=False))
+    if len(detail) > MAX_DEAD_LETTER_REASON_CHARS:
+        detail = f"{detail[:MAX_DEAD_LETTER_REASON_CHARS]}...(truncated)"
+    return f"{prefix}: {detail}"

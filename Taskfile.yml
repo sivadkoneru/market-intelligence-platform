@@ -34,6 +34,12 @@ tasks:
     cmds:
       - .venv/bin/ruff check .
 
+  typecheck:
+    desc: Static type analysis with mypy
+    deps: [setup]
+    cmds:
+      - .venv/bin/mypy libs services scripts tests conftest.py
+
   format:
     desc: Format code with black and ruff
     cmds:

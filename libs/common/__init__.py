@@ -26,6 +26,8 @@ from libs.common.es import (
 )
 from libs.common.logging import (
     HTTPMetrics,
+    ServiceMetrics,
+    WorkerMetrics,
     bind_context,
     bind_correlation_id,
     bind_trace_id,
@@ -34,9 +36,11 @@ from libs.common.logging import (
     create_observability_middleware,
     get_logger,
     install_observability,
+    render_counters,
     reset_context,
 )
 from libs.common.redis_client import (
+    IDEMPOTENCY_TTL_SECONDS,
     Cache,
     InMemoryCache,
     RedisCache,
@@ -46,10 +50,14 @@ from libs.common.resilience import (
     CircuitBreaker,
     CircuitOpenError,
     CircuitState,
+    close_backends,
+    dead_letter_message,
     retry_async,
+    run_poll_loop,
     with_retry,
 )
 from libs.common.schema import (
+    INSIGHT_CACHE_PREFIX,
     TOPIC_ALERTS,
     TOPIC_INSIGHTS,
     TOPIC_MARKET_RAW,
@@ -62,6 +70,7 @@ from libs.common.schema import (
     NewsEvent,
     Signal,
     market_event_key,
+    validation_reason,
 )
 
 __all__ = [
@@ -78,8 +87,11 @@ __all__ = [
     "TOPIC_SIGNALS",
     "TOPIC_INSIGHTS",
     "TOPIC_ALERTS",
+    "INSIGHT_CACHE_PREFIX",
     # Idempotency helper
     "market_event_key",
+    # Dead-letter reason formatting
+    "validation_reason",
     # Config
     "Settings",
     "get_settings",
@@ -88,6 +100,9 @@ __all__ = [
     "configure_new_relic",
     "get_logger",
     "HTTPMetrics",
+    "ServiceMetrics",
+    "WorkerMetrics",
+    "render_counters",
     "bind_correlation_id",
     "bind_trace_id",
     "bind_context",
@@ -100,6 +115,9 @@ __all__ = [
     "CircuitState",
     "retry_async",
     "with_retry",
+    "run_poll_loop",
+    "dead_letter_message",
+    "close_backends",
     # Message bus (Service Bus port)
     "MessageBus",
     "InMemoryBus",
@@ -111,6 +129,7 @@ __all__ = [
     "InMemoryCache",
     "RedisCache",
     "get_cache",
+    "IDEMPOTENCY_TTL_SECONDS",
     # Time-series store (Druid port)
     "TimeSeriesStore",
     "InMemoryTimeSeriesStore",

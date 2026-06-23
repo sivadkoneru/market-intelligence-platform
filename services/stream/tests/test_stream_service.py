@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -11,6 +11,7 @@ from libs.common import (
     InMemoryBus,
     InMemoryCache,
     InMemoryTimeSeriesStore,
+    MarketEvent,
     market_event_key,
 )
 from services.stream.app import app, build_default_service, create_app
@@ -91,9 +92,9 @@ async def _build_service(
 
 @pytest.mark.asyncio
 async def test_service_ingests_druid_rows_caches_snapshot_and_publishes_signal() -> None:
-    store = RecordingStore()
-    service, bus, cache, store = await _build_service(store=store)
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    recording_store = RecordingStore()
+    service, bus, cache, store = await _build_service(store=recording_store)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
 
     for index, price in enumerate((100.0, 101.0, 102.0, 103.0, 104.0, 140.0), start=1):
         body, message_id = _market_message(
@@ -111,10 +112,10 @@ async def test_service_ingests_druid_rows_caches_snapshot_and_publishes_signal()
     assert processed == 6
     assert await store.count("ticks") == 6
     assert await store.count("indicators") == 6
-    assert len(store.ingest_calls) == 12
-    assert all(len(call) == 1 for call in store.ingest_calls)
-    assert store.ingest_calls[0][0]["_table"] == "ticks"
-    assert store.ingest_calls[1][0]["_table"] == "indicators"
+    assert len(recording_store.ingest_calls) == 12
+    assert all(len(call) == 1 for call in recording_store.ingest_calls)
+    assert recording_store.ingest_calls[0][0]["_table"] == "ticks"
+    assert recording_store.ingest_calls[1][0]["_table"] == "indicators"
 
     tick_rows = await store.query_sql('SELECT * FROM "ticks"')
     indicator_rows = await store.query_sql('SELECT * FROM "indicators"')
@@ -159,11 +160,9 @@ async def test_service_ingests_druid_rows_caches_snapshot_and_publishes_signal()
 @pytest.mark.asyncio
 async def test_service_suppresses_duplicate_market_events() -> None:
     service, bus, cache, store = await _build_service()
-    ts = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     body, _ = _market_message(symbol="ETHUSDT", ts=ts, price=2500.0, message_id="first")
-    processed_key = (
-        "stream:processed:" + market_event_key("ETHUSDT", ts, "replay.binance")
-    )
+    processed_key = "stream:processed:" + market_event_key("ETHUSDT", ts, "replay.binance")
 
     await bus.publish(TOPIC_MARKET_RAW, body, message_id="delivery-a")
     await bus.publish(TOPIC_MARKET_RAW, body, message_id="delivery-b")
@@ -208,11 +207,9 @@ async def test_service_dead_letters_invalid_payloads() -> None:
 
 @pytest.mark.asyncio
 async def test_processing_failure_dead_letters_without_processed_marker_and_allows_retry() -> None:
-    ts = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    ts = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
     body, _ = _market_message(symbol="ADAUSDT", ts=ts, price=1.25, message_id="ada-1")
-    processed_key = (
-        "stream:processed:" + market_event_key("ADAUSDT", ts, "replay.binance")
-    )
+    processed_key = "stream:processed:" + market_event_key("ADAUSDT", ts, "replay.binance")
 
     failing_store = FailingIndicatorStore()
     service, bus, cache, store = await _build_service(store=failing_store)
@@ -230,6 +227,7 @@ async def test_processing_failure_dead_letters_without_processed_marker_and_allo
 
     dlq_messages = await bus.receive_dead_letter(TOPIC_MARKET_RAW, STREAM_SUBSCRIPTION)
     assert len(dlq_messages) == 1
+    assert service.metrics.last_error is not None
     assert "stream processing failed" in service.metrics.last_error
 
     retry_store = RecordingStore()
@@ -296,7 +294,7 @@ def test_app_lifespan_starts_background_poller() -> None:
 
     body, message_id = _market_message(
         symbol="SOLUSDT",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         price=200.0,
         message_id="sol-1",
     )
@@ -325,16 +323,14 @@ async def test_run_forever_retries_after_transient_poll_failure() -> None:
     bus.failures_remaining = 1
     body, message_id = _market_message(
         symbol="BTCUSDT",
-        ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
         price=42000.0,
         message_id="btc-retry",
     )
     await bus.publish(TOPIC_MARKET_RAW, body, message_id=message_id)
 
     service = StreamService(bus=bus, cache=cache, store=store)
-    worker = asyncio.create_task(
-        service.run_forever(poll_interval_seconds=0.01, max_messages=1)
-    )
+    worker = asyncio.create_task(service.run_forever(poll_interval_seconds=0.01, max_messages=1))
     try:
         for _ in range(50):
             if service.metrics.messages_processed:
@@ -351,3 +347,97 @@ async def test_run_forever_retries_after_transient_poll_failure() -> None:
         == "stream polling failed: ConnectionError: service bus not ready"
     )
     assert await cache.get_snapshot("BTCUSDT") is not None
+
+
+def test_price_history_is_bounded_per_symbol() -> None:
+    """An unbounded history grew memory and per-event latency without limit."""
+    from services.stream.service import IndicatorConfig, StreamProcessor
+
+    config = IndicatorConfig()
+    processor = StreamProcessor(config)
+    for index in range(5_000):
+        event = MarketEvent(
+            symbol="BTCUSDT",
+            source="test",
+            event_type="trade",
+            price=100.0 + index,
+            ts=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+        )
+        processor.process(event)
+        processor.commit(event)
+
+    history = processor.price_history("BTCUSDT")
+
+    assert len(history) == config.history_maxlen
+    assert history[-1] == 100.0 + 4_999, "the newest price must be retained"
+
+
+def test_history_bound_leaves_windowed_indicators_exact() -> None:
+    """The retained window is a generous multiple of the longest indicator window."""
+    from services.stream.service import IndicatorConfig
+
+    config = IndicatorConfig()
+
+    assert config.history_maxlen > config.sma_window
+    assert config.history_maxlen > config.rsi_period + 1
+    assert config.history_maxlen > config.ewma_span * 4
+
+
+def test_price_history_accessor_matches_the_module_helper() -> None:
+    from services.stream.service import StreamProcessor, price_history_for_symbol
+
+    processor = StreamProcessor()
+    event = MarketEvent(
+        symbol="ETHUSDT",
+        source="test",
+        event_type="trade",
+        price=2500.0,
+        ts=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    processor.commit(event)
+
+    assert processor.price_history("ETHUSDT") == (2500.0,)
+    assert price_history_for_symbol(processor, "ETHUSDT") == (2500.0,)
+
+
+# ---------------------------------------------------------------------------
+# Backend release on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _ClosableBackend:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_service_closes_every_backend_it_owns():
+    """
+    A restart must not strand the sockets the service opened.
+
+    DruidClient and RedisCache now hold persistent connections, so a service
+    that never closes them leaks one set per crash-loop restart.
+    """
+    store, cache, bus = _ClosableBackend(), _ClosableBackend(), _ClosableBackend()
+    service = StreamService(bus=bus, cache=cache, store=store)
+
+    await service.close()
+
+    assert (store.closed, cache.closed, bus.closed) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_service_close_survives_a_failing_backend():
+    class _Exploding:
+        async def close(self) -> None:
+            raise RuntimeError("unreachable")
+
+    healthy = _ClosableBackend()
+    service = StreamService(bus=healthy, cache=_Exploding(), store=_ClosableBackend())
+
+    await service.close()  # must not raise
+
+    assert healthy.closed == 1

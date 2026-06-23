@@ -84,9 +84,7 @@ async def test_replay_completes_dead_letter_after_republish() -> None:
     result = await replay_dead_letters(bus, topic=TOPIC_INSIGHTS, suffix="retry")
 
     assert result.replayed == 1
-    assert bus.published == [
-        (TOPIC_INSIGHTS, {"event_id": "ins-1"}, "dlq-1:retry:1")
-    ]
+    assert bus.published == [(TOPIC_INSIGHTS, {"event_id": "ins-1"}, "dlq-1:retry:1")]
     assert bus.completed == bus.dead_letters
 
 

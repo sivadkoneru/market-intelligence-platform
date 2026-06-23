@@ -28,7 +28,7 @@
               {
                 "Name": "api",
                 "Properties": {
-                  "DeadLetteringOnMessageExpiration": true,
+                  "DeadLetteringOnMessageExpiration": false,
                   "DefaultMessageTimeToLive": "PT1H",
                   "LockDuration": "PT1M",
                   "MaxDeliveryCount": 5,
@@ -108,7 +108,7 @@
               {
                 "Name": "api",
                 "Properties": {
-                  "DeadLetteringOnMessageExpiration": true,
+                  "DeadLetteringOnMessageExpiration": false,
                   "DefaultMessageTimeToLive": "PT1H",
                   "LockDuration": "PT1M",
                   "MaxDeliveryCount": 5,
@@ -154,7 +154,7 @@
               {
                 "Name": "api",
                 "Properties": {
-                  "DeadLetteringOnMessageExpiration": true,
+                  "DeadLetteringOnMessageExpiration": false,
                   "DefaultMessageTimeToLive": "PT1H",
                   "LockDuration": "PT1M",
                   "MaxDeliveryCount": 5,
@@ -188,7 +188,7 @@
               {
                 "Name": "api",
                 "Properties": {
-                  "DeadLetteringOnMessageExpiration": true,
+                  "DeadLetteringOnMessageExpiration": false,
                   "DefaultMessageTimeToLive": "PT1H",
                   "LockDuration": "PT1M",
                   "MaxDeliveryCount": 5,

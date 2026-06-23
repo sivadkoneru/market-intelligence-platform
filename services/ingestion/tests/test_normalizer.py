@@ -64,3 +64,44 @@ def test_normalize_coinbase_payload_to_market_event() -> None:
 def test_normalize_rejects_unknown_payload_shape() -> None:
     with pytest.raises(ValueError):
         normalize_market_payload({"foo": "bar"})
+
+
+def test_normalize_binance_24hr_ticker_uses_last_price_and_base_volume() -> None:
+    """
+    A real 24hrTicker frame carries every field letter at once.
+
+    Binance reuses letters across streams: here `p` is the 24h price *change*
+    (negative on a down day) and `q` the quote volume, while the last price is
+    `c` and the base volume `v`.
+    """
+    event = normalize_market_payload(
+        {
+            "e": "24hrTicker",
+            "E": 1704067200000,
+            "s": "BTCUSDT",
+            "p": "-150.10",
+            "P": "-0.355",
+            "c": "42100.20",
+            "v": "18.5",
+            "q": "778000.0",
+            "b": "42100.0",
+            "a": "42100.4",
+        }
+    )
+
+    assert event.event_type == "ticker"
+    assert event.price == 42100.20
+    assert event.volume == 18.5
+    assert event.bid == 42100.0
+    assert event.ask == 42100.4
+
+
+def test_normalize_binance_trade_uses_trade_price_and_quantity() -> None:
+    """The same letters mean price/quantity on a `trade` frame."""
+    event = normalize_market_payload(
+        {"e": "trade", "s": "BTCUSDT", "p": "42100.5", "q": "0.25", "T": 1704067200000}
+    )
+
+    assert event.event_type == "trade"
+    assert event.price == 42100.5
+    assert event.volume == 0.25

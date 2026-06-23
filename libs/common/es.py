@@ -27,25 +27,37 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+# numpy is optional; knn_search calls this once per stored document, so the
+# import is hoisted out of the hot path rather than repeated per call.
+_np: Any = None
+try:
+    import numpy as _numpy
+except ImportError:  # pragma: no cover - numpy is a pinned dependency
+    pass
+else:
+    _np = _numpy
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Return cosine similarity in [-1, 1]."""
-    try:
-        import numpy as np  # type: ignore
+    if _np is not None:
+        va = _np.array(a, dtype=float)
+        vb = _np.array(b, dtype=float)
+        norm_a = _np.linalg.norm(va)
+        norm_b = _np.linalg.norm(vb)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(_np.dot(va, vb) / (norm_a * norm_b))
 
-        va = np.array(a, dtype=float)
-        vb = np.array(b, dtype=float)
-        norm_a = np.linalg.norm(va)
-        norm_b = np.linalg.norm(vb)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(va, vb) / (norm_a * norm_b))
-    except ImportError:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(y * y for y in b))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+    # strict=True: a bare zip truncates to the shorter vector, so mismatched
+    # dimensions would silently yield a plausible-but-wrong similarity here
+    # while the numpy path above raises. Both branches must agree.
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +82,7 @@ class SearchStore(Protocol):
         doc_id: str,
         doc: dict[str, Any],
         vector: list[float] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def knn_search(
         self,
@@ -83,13 +94,9 @@ class SearchStore(Protocol):
         Each result dict includes the original document fields plus ``_score``."""
         ...
 
-    async def index_log(self, index: str, log: dict[str, Any]) -> None:
-        ...
+    async def index_log(self, index: str, log: dict[str, Any]) -> None: ...
 
-    async def search(
-        self, index: str, query: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        ...
+    async def search(self, index: str, query: dict[str, Any]) -> list[dict[str, Any]]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -184,21 +191,30 @@ class InMemorySearchStore:
             results.append(row)
         return results
 
-    async def index_log(self, index: str, log: dict[str, Any]) -> None:
+    def record_log(self, index: str, log: dict[str, Any]) -> None:
+        """
+        Append a log document synchronously.
+
+        The structlog sink runs inside a sync processor, so it needs a way to
+        mirror into the fake without an event loop. Exposing it here keeps
+        callers off ``_logs``.
+        """
         self._logs.setdefault(index, []).append(dict(log))
 
-    async def search(
-        self, index: str, query: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def logs(self, index: str) -> list[dict[str, Any]]:
+        """Return the documents recorded for *index* (empty when unused)."""
+        return self._logs.get(index, [])
+
+    async def index_log(self, index: str, log: dict[str, Any]) -> None:
+        self.record_log(index, log)
+
+    async def search(self, index: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         """
         Minimal query support: returns all documents from *index*.
         The ``query`` dict is ignored in the fake (all docs returned).
         """
         store = self._indices.get(index, {})
-        return [
-            {**entry["_doc"], "_id": doc_id}
-            for doc_id, entry in store.items()
-        ]
+        return [{**entry["_doc"], "_id": doc_id} for doc_id, entry in store.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +230,7 @@ class ElasticsearchStore:
     """
 
     def __init__(self, url: str) -> None:
-        from elasticsearch import AsyncElasticsearch  # type: ignore
+        from elasticsearch import AsyncElasticsearch
 
         self._es = AsyncElasticsearch([url])
 
@@ -303,9 +319,7 @@ class ElasticsearchStore:
     async def index_log(self, index: str, log: dict[str, Any]) -> None:
         await self._es.index(index=index, document=log)
 
-    async def search(
-        self, index: str, query: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    async def search(self, index: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         resp = await self._es.search(index=index, body=query)
         return [
             {**hit["_source"], "_id": hit["_id"], "_score": hit["_score"]}
@@ -326,12 +340,9 @@ def get_search_store(settings: Any = None) -> SearchStore:
     Return InMemorySearchStore when ELASTICSEARCH_URL is the default placeholder,
     else return ElasticsearchStore.
     """
-    if settings is None:
-        from libs.common.config import get_settings
+    from libs.common.config import is_default, resolve_settings
 
-        settings = get_settings()
-
-    es_url: str = settings.elasticsearch_url or ""
-    if not es_url or es_url == "http://localhost:9200":
+    es_url: str = resolve_settings(settings).elasticsearch_url or ""
+    if not es_url or is_default("elasticsearch_url", es_url):
         return InMemorySearchStore()
     return ElasticsearchStore(es_url)

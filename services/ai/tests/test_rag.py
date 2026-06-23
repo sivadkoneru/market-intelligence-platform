@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import pytest
@@ -22,7 +23,7 @@ from services.ai.rag import (
 
 @dataclass
 class FakeEmbeddingProvider:
-    mapping: dict[str, tuple[float, ...]]
+    mapping: Mapping[str, tuple[float, ...]]
     dimensions: int = 3
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResult:
@@ -102,10 +103,7 @@ async def test_index_source_document_stores_vectors_and_chunk_payloads() -> None
     store = InMemorySearchStore()
     document = _source_document()
     chunks = chunk_document(document, ChunkingConfig(max_chars=140, max_tokens=20))
-    mapping = {
-        chunk.text: (float(index + 1), 0.0, 0.0)
-        for index, chunk in enumerate(chunks)
-    }
+    mapping = {chunk.text: (float(index + 1), 0.0, 0.0) for index, chunk in enumerate(chunks)}
     pipeline = RAGPipeline(
         search_store=store,
         embedding_provider=FakeEmbeddingProvider(mapping),

@@ -45,9 +45,7 @@ def _split_paragraphs(text: str) -> list[_TextSegment]:
         if stripped:
             leading = len(part) - len(part.lstrip())
             start = position + leading
-            paragraphs.append(
-                _TextSegment(text=stripped, start=start, end=start + len(stripped))
-            )
+            paragraphs.append(_TextSegment(text=stripped, start=start, end=start + len(stripped)))
         position += len(part)
     return paragraphs
 
@@ -134,9 +132,7 @@ def _split_segments(text: str, config: ChunkingConfig) -> list[_TextSegment]:
             ):
                 segments.append(sentence)
             else:
-                segments.extend(
-                    _split_long_sentence(sentence, config.max_chars, config.max_tokens)
-                )
+                segments.extend(_split_long_sentence(sentence, config.max_chars, config.max_tokens))
     return segments
 
 

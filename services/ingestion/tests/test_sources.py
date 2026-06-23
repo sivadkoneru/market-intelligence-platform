@@ -75,7 +75,7 @@ async def test_rss_collector_parses_symbols_and_news_fields() -> None:
 
 @pytest.mark.asyncio
 async def test_rest_collector_parses_hn_and_reddit_like_payloads() -> None:
-    payloads = {
+    payloads: dict[str, dict[str, object]] = {
         "https://example.com/hn": {
             "hits": [
                 {
@@ -254,3 +254,86 @@ async def test_collectors_use_injected_fetchers_without_network(
 
     assert len(rss_events) == 1
     assert len(rest_events) == 1
+
+
+ENTITY_BOMB_FEED = """<?xml version="1.0"?>
+<!DOCTYPE rss [
+<!ENTITY a "AAAAAAAAAA">
+<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">
+<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
+]>
+<rss version="2.0"><channel><item><title>&c;</title></item></channel></rss>"""
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_refuses_a_feed_that_declares_a_dtd() -> None:
+    """xml.etree expands internal entities, so a DTD is a billion-laughs vector."""
+
+    async def bomb_fetcher(_: str) -> str:
+        return ENTITY_BOMB_FEED
+
+    collector = RssCollector(
+        [RssFeed(url="https://example.com/bomb.xml", source="example-rss")],
+        fetcher=bomb_fetcher,
+    )
+
+    with pytest.raises(ValueError, match="DOCTYPE"):
+        await collector.poll_once()
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_accepts_a_feed_mentioning_doctype_in_its_body() -> None:
+    """The guard scans the prolog only, so article text is not collateral damage."""
+    feed = (
+        '<?xml version="1.0"?><rss version="2.0"><channel><item>'
+        "<title>How to write a BTC page header</title>"
+        "<description><![CDATA[A guide mentioning <!DOCTYPE html> inline.]]></description>"
+        "</item></channel></rss>"
+    )
+
+    async def fetcher(_: str) -> str:
+        return feed
+
+    collector = RssCollector(
+        [RssFeed(url="https://example.com/feed.xml", source="example-rss")],
+        fetcher=fetcher,
+    )
+
+    events = await collector.poll_once()
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_rejects_an_oversized_payload() -> None:
+    from services.ingestion.sources.rss import MAX_FEED_BYTES
+
+    async def huge_fetcher(_: str) -> str:
+        return "<rss>" + ("x" * (MAX_FEED_BYTES + 1)) + "</rss>"
+
+    collector = RssCollector(
+        [RssFeed(url="https://example.com/huge.xml", source="example-rss")],
+        fetcher=huge_fetcher,
+    )
+
+    with pytest.raises(ValueError, match="exceeds"):
+        await collector.poll_once()
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_caps_entries_per_poll() -> None:
+    from services.ingestion.sources.rss import MAX_ENTRIES_PER_FEED
+
+    items = "".join(
+        f"<item><title>BTC item {i}</title></item>" for i in range(MAX_ENTRIES_PER_FEED + 25)
+    )
+
+    async def fetcher(_: str) -> str:
+        return f'<?xml version="1.0"?><rss version="2.0"><channel>{items}</channel></rss>'
+
+    collector = RssCollector(
+        [RssFeed(url="https://example.com/feed.xml", source="example-rss")],
+        fetcher=fetcher,
+    )
+
+    events = await collector.poll_once()
+    assert len(events) == MAX_ENTRIES_PER_FEED

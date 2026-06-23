@@ -15,15 +15,77 @@ get_cache()     — Factory.
 
 from __future__ import annotations
 
+import json
 import time as _time
-from typing import Any, Callable, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "Cache",
     "InMemoryCache",
     "RedisCache",
     "get_cache",
+    "encode_cache_value",
+    "decode_cache_value",
+    "snapshot_key",
+    "seen_key",
+    "IDEMPOTENCY_TTL_SECONDS",
+    "SNAPSHOT_PREFIX",
 ]
+
+# How long a "already handled this event" marker is retained. It has to outlast
+# the broker's redelivery and duplicate-detection windows, but not forever:
+# without a TTL every unique event leaves a permanent key, so the store grows
+# without bound for as long as the platform runs.
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+
+# Key namespaces. These are a cross-process contract — the stream service writes
+# snapshots and the API reads them — so they are named once here rather than
+# spelled out at each call site, where the fake and the real client could drift
+# apart without any test noticing.
+SNAPSHOT_PREFIX = "snapshot"
+SEEN_PREFIX = "seen"
+
+
+def snapshot_key(symbol: str) -> str:
+    """Return the cache key holding the latest snapshot for *symbol*."""
+    return f"{SNAPSHOT_PREFIX}:{symbol}"
+
+
+def seen_key(key: str) -> str:
+    """Return the cache key holding the idempotency marker for *key*."""
+    return f"{SEEN_PREFIX}:{key}"
+
+
+# ---------------------------------------------------------------------------
+# Serialisation codec
+# ---------------------------------------------------------------------------
+#
+# JSON, deliberately — never pickle. Redis contents are data from outside this
+# process, and ``pickle.loads`` on attacker-influenced bytes is arbitrary code
+# execution. Every value the platform caches (snapshots, indicator history,
+# ``model_dump(mode="json")`` payloads, boolean idempotency markers) is already
+# JSON-native, so JSON costs nothing and keeps the cache readable by other
+# tools.
+
+
+def encode_cache_value(value: Any) -> bytes:
+    """Serialise *value* for storage in Redis."""
+    return json.dumps(value).encode("utf-8")
+
+
+def decode_cache_value(key: str, raw: bytes) -> Any:
+    """
+    Deserialise a Redis payload written by :func:`encode_cache_value`.
+
+    Raises ``ValueError`` naming *key* when the stored bytes are not valid JSON
+    (corruption, or a value written by an older pickle-based build) so the
+    failure is diagnosable instead of silently degrading to a cache miss.
+    """
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cache value for key {key!r} is not valid JSON") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -33,31 +95,24 @@ __all__ = [
 
 @runtime_checkable
 class Cache(Protocol):
-    async def get(self, key: str) -> Any | None:
-        ...
+    async def get(self, key: str) -> Any | None: ...
 
-    async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        ...
+    async def set(self, key: str, value: Any, ttl: int | None = None) -> None: ...
 
     async def set_if_absent(
         self,
         key: str,
         value: Any,
         ttl: int | None = None,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
-    async def delete(self, key: str) -> None:
-        ...
+    async def delete(self, key: str) -> None: ...
 
-    async def set_snapshot(self, symbol: str, data: dict[str, Any]) -> None:
-        ...
+    async def set_snapshot(self, symbol: str, data: dict[str, Any]) -> None: ...
 
-    async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        ...
+    async def get_snapshot(self, symbol: str) -> dict[str, Any] | None: ...
 
-    async def list_snapshot_symbols(self) -> list[str]:
-        ...
+    async def list_snapshot_symbols(self) -> list[str]: ...
 
     async def seen(self, key: str) -> bool:
         """Idempotency check: returns False the first time, True every subsequent time."""
@@ -107,7 +162,15 @@ class InMemoryCache:
         value: Any,
         ttl: int | None = None,
     ) -> bool:
-        if await self.get(key) is not None:
+        # Keyed on presence, not on truthiness. ``get()`` returns None both for
+        # a missing key and for one holding a stored None, so testing its result
+        # made a key holding None look absent — while ``RedisCache`` (SET NX)
+        # treats any existing key as present. A lock is exactly where the fake
+        # and the real client must not disagree.
+        if self._is_expired(key):
+            self._store.pop(key, None)
+            self._expiry.pop(key, None)
+        if key in self._store:
             return False
         await self.set(key, value, ttl=ttl)
         return True
@@ -117,19 +180,20 @@ class InMemoryCache:
         self._expiry.pop(key, None)
 
     async def set_snapshot(self, symbol: str, data: dict[str, Any]) -> None:
-        await self.set(f"snapshot:{symbol}", data)
+        await self.set(snapshot_key(symbol), data)
 
     async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        return await self.get(f"snapshot:{symbol}")
+        return await self.get(snapshot_key(symbol))
 
     async def list_snapshot_symbols(self) -> list[str]:
+        prefix = f"{SNAPSHOT_PREFIX}:"
         symbols: list[str] = []
         for key in list(self._store):
-            if not key.startswith("snapshot:"):
+            if not key.startswith(prefix):
                 continue
             if await self.get(key) is None:
                 continue
-            symbol = key.removeprefix("snapshot:")
+            symbol = key.removeprefix(prefix)
             if symbol:
                 symbols.append(symbol)
         return sorted(symbols)
@@ -159,17 +223,13 @@ class RedisCache:
         self._client = aioredis.from_url(url, decode_responses=False)
 
     async def get(self, key: str) -> Any | None:
-        import pickle
-
         raw = await self._client.get(key)
         if raw is None:
             return None
-        return pickle.loads(raw)
+        return decode_cache_value(key, raw)
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        import pickle
-
-        serialised = pickle.dumps(value)
+        serialised = encode_cache_value(value)
         if ttl is not None:
             await self._client.setex(key, ttl, serialised)
         else:
@@ -181,40 +241,44 @@ class RedisCache:
         value: Any,
         ttl: int | None = None,
     ) -> bool:
-        import pickle
-
-        serialised = pickle.dumps(value)
+        serialised = encode_cache_value(value)
         return bool(await self._client.set(key, serialised, ex=ttl, nx=True))
 
     async def delete(self, key: str) -> None:
         await self._client.delete(key)
 
     async def set_snapshot(self, symbol: str, data: dict[str, Any]) -> None:
-        await self.set(f"snapshot:{symbol}", data)
+        await self.set(snapshot_key(symbol), data)
 
     async def get_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        return await self.get(f"snapshot:{symbol}")
+        return await self.get(snapshot_key(symbol))
 
     async def list_snapshot_symbols(self) -> list[str]:
+        prefix = f"{SNAPSHOT_PREFIX}:"
         symbols: list[str] = []
-        async for key in self._client.scan_iter(match="snapshot:*"):
+        async for key in self._client.scan_iter(match=f"{prefix}*"):
             key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-            symbol = key_text.removeprefix("snapshot:")
+            symbol = key_text.removeprefix(prefix)
             if symbol:
                 symbols.append(symbol)
         return sorted(symbols)
 
     async def seen(self, key: str) -> bool:
         """
-        SETNX-like idempotency check.
-        Returns False the first time (key was absent), True thereafter.
-        Uses a long TTL (24 h) as the idempotency window.
+        Idempotency check: returns False the first time, True thereafter.
+
+        Set-and-expire is issued as one ``SET ... NX EX`` rather than SETNX
+        followed by EXPIRE. The two-command form is not atomic: a process that
+        dies between them leaves a marker with no TTL, which never expires and
+        so defeats the bound ``IDEMPOTENCY_TTL_SECONDS`` exists to enforce.
         """
-        result = await self._client.setnx(f"seen:{key}", b"1")
-        if result:
-            await self._client.expire(f"seen:{key}", 86400)
-            return False
-        return True
+        created = await self._client.set(
+            seen_key(key),
+            b"1",
+            ex=IDEMPOTENCY_TTL_SECONDS,
+            nx=True,
+        )
+        return not created
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -230,13 +294,10 @@ def get_cache(settings: Any = None) -> Cache:
     Return InMemoryCache when REDIS_URL is unset or uses the default placeholder,
     else return RedisCache.
     """
-    if settings is None:
-        from libs.common.config import get_settings
+    from libs.common.config import is_default, resolve_settings
 
-        settings = get_settings()
-
-    redis_url: str = settings.redis_url or ""
-    if not redis_url or redis_url == "redis://localhost:6379/0":
+    redis_url: str = resolve_settings(settings).redis_url or ""
+    if not redis_url or is_default("redis_url", redis_url):
         # Default placeholder — use fake so tests run offline
         return InMemoryCache()
     return RedisCache(redis_url)

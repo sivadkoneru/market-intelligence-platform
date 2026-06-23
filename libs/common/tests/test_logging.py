@@ -6,10 +6,13 @@ import json
 import pathlib
 import sys
 import types
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from libs.common.es import SearchStore
 
 
 def test_configure_logging_does_not_raise():
@@ -111,14 +114,15 @@ def test_log_level_field_present(capsys):
 
 def test_no_bare_print():
     """The logging module itself must not use bare print calls."""
-    src = pathlib.Path(
-        "/Users/sivakoneru/Development/market-intelligence-platform/libs/common/logging.py"
-    ).read_text()
+    src = (pathlib.Path(__file__).parents[1] / "logging.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id == "print":
-                pytest.fail("Found bare print() call in libs/common/logging.py")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ):
+            pytest.fail("Found bare print() call in libs/common/logging.py")
 
 
 def test_configure_logging_persists_to_in_memory_search_store(capsys):
@@ -132,10 +136,10 @@ def test_configure_logging_persists_to_in_memory_search_store(capsys):
     captured = capsys.readouterr()
 
     assert captured.out
-    assert "logs-test-svc" in store._logs
-    assert store._logs["logs-test-svc"][-1]["event"] == "persist me"
-    assert store._logs["logs-test-svc"][-1]["answer"] == 42
-    assert store._logs["logs-test-svc"][-1]["service"] == "test-svc"
+    assert store.logs("logs-test-svc")
+    assert store.logs("logs-test-svc")[-1]["event"] == "persist me"
+    assert store.logs("logs-test-svc")[-1]["answer"] == 42
+    assert store.logs("logs-test-svc")[-1]["service"] == "test-svc"
 
 
 def test_configure_logging_clears_previous_search_store(capsys):
@@ -146,7 +150,7 @@ def test_configure_logging_clears_previous_search_store(capsys):
     configure_logging(level="INFO", service_name="first", search_store=store)
     reset_context()
     get_logger("test.es").info("persisted")
-    assert store._logs["logs-first"][-1]["event"] == "persisted"
+    assert store.logs("logs-first")[-1]["event"] == "persisted"
 
     configure_logging(level="INFO")
     reset_context()
@@ -156,7 +160,7 @@ def test_configure_logging_clears_previous_search_store(capsys):
 
     assert captured.out
     assert event["service"] == "market-intel"
-    assert "logs-market-intel" not in store._logs
+    assert store.logs("logs-market-intel") == []
 
 
 def test_configure_logging_swallow_search_store_failures(capsys):
@@ -169,7 +173,7 @@ def test_configure_logging_swallow_search_store_failures(capsys):
     configure_logging(
         level="INFO",
         service_name="test-svc",
-        search_store=FailingSearchStore(),
+        search_store=cast(SearchStore, FailingSearchStore()),
     )
     reset_context()
     get_logger("test.es").info("survives sink failure")
@@ -189,7 +193,7 @@ def test_configure_logging_swallow_async_search_store_failures(capsys):
         configure_logging(
             level="INFO",
             service_name="test-svc",
-            search_store=FailingSearchStore(),
+            search_store=cast(SearchStore, FailingSearchStore()),
         )
         reset_context()
         get_logger("test.es").info("survives async sink failure")
@@ -345,3 +349,46 @@ def test_configure_new_relic_initializes_fake_agent(monkeypatch):
     assert configure_new_relic(settings, service_name="api") is True
     assert calls[0] == ("initialize", (), {})
     assert calls[1] == ("register_application", (), {"timeout": 0})
+
+
+def test_unmatched_paths_collapse_to_one_metric_label():
+    """
+    Metric labels must come from a closed set.
+
+    Starlette leaves scope["route"] unset on a 404, so echoing request.url.path
+    would let an unauthenticated caller add a permanent dict entry — and a
+    /metrics line — per distinct URL.
+    """
+    from libs.common.logging import UNMATCHED_ROUTE, HTTPMetrics, install_observability
+
+    app = FastAPI()
+    metrics = HTTPMetrics()
+    install_observability(app, service_name="test-svc", metrics=metrics)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    with TestClient(app) as client:
+        for index in range(5):
+            client.get(f"/nope/{index}-attacker-controlled")
+
+    assert list(metrics.requests_by_path) == [UNMATCHED_ROUTE]
+    assert metrics.requests_by_path[UNMATCHED_ROUTE] == 5
+
+
+def test_unknown_http_methods_collapse_to_one_metric_label():
+    from libs.common.logging import OTHER_METHOD, HTTPMetrics
+
+    metrics = HTTPMetrics()
+    for method in ("GET", "BREW", "WHATEVER"):
+        metrics.record_http_request(
+            method=method,
+            path="/health",
+            status_code=200,
+            duration_ms=1.0,
+            trace_context_provided=False,
+            correlation_context_provided=False,
+        )
+
+    assert metrics.requests_by_method == {"GET": 1, OTHER_METHOD: 2}

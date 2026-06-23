@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any
 
 from libs.common import (
     TOPIC_MARKET_RAW,
@@ -178,9 +179,7 @@ async def run() -> int:
     args = build_parser().parse_args()
     run_id = args.run_id or datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
     symbols = tuple(
-        symbol.strip().upper()
-        for symbol in (args.symbols or DEFAULT_SYMBOLS)
-        if symbol.strip()
+        symbol.strip().upper() for symbol in (args.symbols or DEFAULT_SYMBOLS) if symbol.strip()
     )
     await publish_seed_data(
         events=args.events,

@@ -25,8 +25,7 @@ class NewsCollector(Protocol):
 
     name: str
 
-    async def poll_once(self) -> list[NewsEvent]:
-        ...
+    async def poll_once(self) -> list[NewsEvent]: ...
 
 
 def coerce_datetime(value: Any) -> datetime:
@@ -99,9 +98,10 @@ def extract_symbols(
 
     matches: list[str] = []
     for candidate, canonical in candidates:
-        if re.search(rf"(?<![A-Z0-9]){re.escape(candidate)}(?![A-Z0-9])", upper_text):
-            if canonical not in matches:
-                matches.append(canonical)
+        if canonical not in matches and re.search(
+            rf"(?<![A-Z0-9]){re.escape(candidate)}(?![A-Z0-9])", upper_text
+        ):
+            matches.append(canonical)
     return matches
 
 

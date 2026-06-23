@@ -47,7 +47,7 @@ def relative_strength_index(values: Sequence[float], period: int = 14) -> float 
     avg_gain = float(np.mean(gains[:period]))
     avg_loss = float(np.mean(losses[:period]))
 
-    for gain, loss in zip(gains[period:], losses[period:]):
+    for gain, loss in zip(gains[period:], losses[period:], strict=True):
         avg_gain = ((avg_gain * (period - 1)) + float(gain)) / period
         avg_loss = ((avg_loss * (period - 1)) + float(loss)) / period
 

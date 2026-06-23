@@ -4,33 +4,38 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from inspect import isawaitable
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from libs.common import (
+    INSIGHT_CACHE_PREFIX,
     TOPIC_ALERTS,
     TOPIC_INSIGHTS,
     TOPIC_MARKET_RAW,
     TOPIC_SIGNALS,
     Alert,
     Cache,
-    HTTPMetrics,
     Insight,
     MarketEvent,
     MessageBus,
+    ServiceMetrics,
     Signal,
     TimeSeriesStore,
+    close_backends,
     get_logger,
+    render_counters,
 )
 
 API_SUBSCRIPTION = "api"
 API_WS_SUBSCRIPTION = "api-ws"
-INSIGHT_CACHE_PREFIX = "insight"
 HISTORY_PREFIX = "history"
-INSIGHT_BUS_FALLBACK_LIMIT = 1_000
+# How far back the peek-based read model looks. peek() returns from the head
+# of the subscription, so responses take the TAIL of this window.
+BUS_PEEK_WINDOW = 1_000
 STREAM_POLL_INTERVAL_SECONDS = 0.05
+MAX_STREAM_QUEUE_SIZE = 1_000
 TopicModel = type[MarketEvent] | type[Signal] | type[Alert] | type[Insight]
 
 
@@ -66,6 +71,7 @@ class LiveStreamBroker:
         self._tasks: list[asyncio.Task[None]] = []
         self._started = False
         self._stop_event = asyncio.Event()
+        self.dropped_stream_messages = 0
         self._topics: tuple[tuple[str, str, TopicModel], ...] = (
             (TOPIC_MARKET_RAW, "market", MarketEvent),
             (TOPIC_SIGNALS, "signal", Signal),
@@ -104,12 +110,20 @@ class LiveStreamBroker:
         self._started = False
 
     def register(self, connection_id: str) -> asyncio.Queue[dict[str, Any]]:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # Bounded so a client that subscribes to a busy symbol and then stops
+        # reading cannot grow the process without limit. On overflow the oldest
+        # pending message is dropped: this is a live stream, so the newest data
+        # is what the client actually wants.
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=MAX_STREAM_QUEUE_SIZE)
         self._subscribers[connection_id] = StreamSubscriber(symbols=set(), queue=queue)
         return queue
 
     def update_symbols(self, connection_id: str, symbols: Sequence[str]) -> list[str]:
-        subscriber = self._subscribers[connection_id]
+        subscriber = self._subscribers.get(connection_id)
+        if subscriber is None:
+            # The connection was dropped (or the broker closed) between the
+            # client's frame arriving and this call.
+            raise ValueError("stream connection is no longer registered")
         subscriber.symbols = {symbol.strip().upper() for symbol in symbols if symbol.strip()}
         return sorted(subscriber.symbols)
 
@@ -192,8 +206,17 @@ class LiveStreamBroker:
             "payload": envelope.payload,
         }
         for subscriber in list(self._subscribers.values()):
-            if envelope.symbol in subscriber.symbols:
-                await subscriber.queue.put(message)
+            if envelope.symbol not in subscriber.symbols:
+                continue
+            try:
+                subscriber.queue.put_nowait(message)
+            except asyncio.QueueFull:
+                # Drop the oldest so a stalled reader cannot block the broker
+                # (an awaiting put would stall fanout for every other client).
+                self.dropped_stream_messages += 1
+                with suppress(asyncio.QueueEmpty):  # drained concurrently
+                    subscriber.queue.get_nowait()
+                subscriber.queue.put_nowait(message)
 
 
 def _backend_name(obj: object) -> str:
@@ -202,7 +225,7 @@ def _backend_name(obj: object) -> str:
 
 
 @dataclass
-class APIMetrics:
+class APIMetrics(ServiceMetrics):
     requests_total: int = 0
     symbols_requests: int = 0
     latest_requests: int = 0
@@ -211,26 +234,6 @@ class APIMetrics:
     signals_requests: int = 0
     alerts_requests: int = 0
     insights_requests: int = 0
-    http: HTTPMetrics = field(default_factory=HTTPMetrics)
-
-    def record_http_request(
-        self,
-        *,
-        method: str,
-        path: str,
-        status_code: int,
-        duration_ms: float,
-        trace_context_provided: bool,
-        correlation_context_provided: bool,
-    ) -> None:
-        self.http.record_http_request(
-            method=method,
-            path=path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-            trace_context_provided=trace_context_provided,
-            correlation_context_provided=correlation_context_provided,
-        )
 
     def render(
         self,
@@ -239,30 +242,30 @@ class APIMetrics:
         cache_backend: str,
         bus_backend: str,
     ) -> str:
-        lines = [
-            "# TYPE api_requests_total counter",
-            f"api_requests_total {self.requests_total}",
-            "# TYPE api_symbols_requests counter",
-            f"api_symbols_requests {self.symbols_requests}",
-            "# TYPE api_market_latest_requests counter",
-            f"api_market_latest_requests {self.latest_requests}",
-            "# TYPE api_market_history_requests counter",
-            f"api_market_history_requests {self.history_requests}",
-            "# TYPE api_indicators_requests counter",
-            f"api_indicators_requests {self.indicators_requests}",
-            "# TYPE api_signals_requests counter",
-            f"api_signals_requests {self.signals_requests}",
-            "# TYPE api_alerts_requests counter",
-            f"api_alerts_requests {self.alerts_requests}",
-            "# TYPE api_insights_requests counter",
-            f"api_insights_requests {self.insights_requests}",
-            "# TYPE api_structured_logging_json gauge",
-            "api_structured_logging_json 1",
-            "# TYPE api_backend_info gauge",
-            f'api_backend_info{{kind="timeseries",backend="{timeseries_backend}"}} 1',
-            f'api_backend_info{{kind="cache",backend="{cache_backend}"}} 1',
-            f'api_backend_info{{kind="bus",backend="{bus_backend}"}} 1',
-        ]
+        lines = render_counters(
+            "api",
+            {
+                "requests_total": self.requests_total,
+                "symbols_requests": self.symbols_requests,
+                # Published under the route they count, not the field name.
+                "market_latest_requests": self.latest_requests,
+                "market_history_requests": self.history_requests,
+                "indicators_requests": self.indicators_requests,
+                "signals_requests": self.signals_requests,
+                "alerts_requests": self.alerts_requests,
+                "insights_requests": self.insights_requests,
+            },
+        )
+        lines.extend(
+            [
+                "# TYPE api_structured_logging_json gauge",
+                "api_structured_logging_json 1",
+                "# TYPE api_backend_info gauge",
+                f'api_backend_info{{kind="timeseries",backend="{timeseries_backend}"}} 1',
+                f'api_backend_info{{kind="cache",backend="{cache_backend}"}} 1',
+                f'api_backend_info{{kind="bus",backend="{bus_backend}"}} 1',
+            ]
+        )
         lines.extend(self.http.render("api"))
         return "\n".join(lines) + "\n"
 
@@ -311,14 +314,13 @@ class APIService:
         await self._stream_broker.start(prime_subscription=self.bus_backend == "inmemorybus")
 
     async def close(self) -> None:
+        """Release the stream broker and every backend, even if one of them fails."""
         await self._stream_broker.close()
-        for backend in (self._cache, self._bus):
-            close = getattr(backend, "close", None)
-            if close is None:
-                continue
-            result = close()
-            if isawaitable(result):
-                await result
+        await close_backends(
+            (self._store, self._cache, self._bus),
+            log=self._log,
+            service_name="api",
+        )
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -345,11 +347,7 @@ class APIService:
               AND "TABLE_NAME" IN ('ticks', 'indicators')
             """
         )
-        known_tables = {
-            str(row["TABLE_NAME"])
-            for row in table_rows
-            if row.get("TABLE_NAME")
-        }
+        known_tables = {str(row["TABLE_NAME"]) for row in table_rows if row.get("TABLE_NAME")}
         rows: list[dict[str, Any]] = []
         for table in candidate_tables:
             if table not in known_tables:
@@ -363,11 +361,7 @@ class APIService:
                     """
                 )
             )
-        symbols = {
-            str(row["symbol"])
-            for row in rows
-            if row.get("symbol")
-        }
+        symbols = {str(row["symbol"]) for row in rows if row.get("symbol")}
         symbols.update(await self._cache.list_snapshot_symbols())
         return sorted(symbols)
 
@@ -389,7 +383,7 @@ class APIService:
                 }
             )
         row = await self._store.latest(symbol)
-        return self._normalise_row(row)
+        return self._normalise_optional_row(row)
 
     async def market_history(
         self,
@@ -397,16 +391,19 @@ class APIService:
         *,
         frm: datetime,
         to: datetime,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         self.metrics.history_requests += 1
         self.metrics.requests_total += 1
-        rows = await self._store.history(symbol, frm, to)
+        rows = await self._store.history(symbol, frm, to, limit=limit)
         cached_rows = await self._cached_history(symbol, frm=frm, to=to)
         merged_rows = self._dedupe_rows([*rows, *cached_rows])
-        return [
-            self._normalise_row(row)
-            for row in sorted(merged_rows, key=self._ts_sort_key)
-        ]
+        ordered = sorted(merged_rows, key=self._ts_sort_key)
+        if limit is not None:
+            # Cached rows are merged in after the store's own LIMIT, so cap the
+            # combined result too — newest wins.
+            ordered = ordered[-limit:]
+        return [self._normalise_row(row) for row in ordered]
 
     async def indicators(self, symbol: str) -> dict[str, Any] | None:
         self.metrics.indicators_requests += 1
@@ -433,11 +430,10 @@ class APIService:
                 },
             }
 
-        rows = await self._rows_for_tables(("indicators",))
-        matches = [row for row in rows if row.get("symbol") == symbol]
-        if not matches:
+        latest = await self._store.latest_indicator(symbol)
+        if latest is None:
             return None
-        latest = max(matches, key=self._ts_sort_key)
+        latest = self._normalise_row(latest)
         return {
             "symbol": symbol,
             "ts": latest.get("ts"),
@@ -458,17 +454,35 @@ class APIService:
             },
         }
 
+    async def _recent_payloads(
+        self,
+        topic: str,
+        model: type[Signal] | type[Alert] | type[Insight],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Return the newest *limit* payloads on *topic*, newest first.
+
+        ``peek`` reads from the head of the subscription — the lowest sequence
+        numbers — so asking it for *limit* messages returns the OLDEST ones and
+        pins the response to the same backlog on every call. Peek a wider
+        window and take its tail instead. Only the returned slice is validated,
+        so cost stays proportional to *limit* rather than to the backlog.
+        """
+        messages = await self._bus.peek(topic, self._subscription, n=BUS_PEEK_WINDOW)
+        newest_first = list(reversed(messages[-limit:])) if limit > 0 else []
+        return self._validated_payloads(newest_first, model)
+
     async def signals(self, *, limit: int = 20) -> list[dict[str, Any]]:
         self.metrics.signals_requests += 1
         self.metrics.requests_total += 1
-        messages = await self._bus.peek(self._signal_topic, self._subscription, n=limit)
-        return self._validated_payloads(messages, Signal)
+        return await self._recent_payloads(self._signal_topic, Signal, limit=limit)
 
     async def alerts(self, *, limit: int = 20) -> list[dict[str, Any]]:
         self.metrics.alerts_requests += 1
         self.metrics.requests_total += 1
-        messages = await self._bus.peek(self._alert_topic, self._subscription, n=limit)
-        return self._validated_payloads(messages, Alert)
+        return await self._recent_payloads(self._alert_topic, Alert, limit=limit)
 
     async def insight(self, symbol: str) -> dict[str, Any] | None:
         self.metrics.insights_requests += 1
@@ -480,10 +494,15 @@ class APIService:
         messages = await self._bus.peek(
             self._insight_topic,
             self._subscription,
-            n=INSIGHT_BUS_FALLBACK_LIMIT,
+            n=BUS_PEEK_WINDOW,
         )
-        for payload in reversed(self._validated_payloads(messages, Insight)):
-            if payload.get("symbol") == symbol:
+        # Newest first, validated lazily: eagerly validating the whole window to
+        # find one symbol cost a full pass of Pydantic work per request and
+        # could emit a warning line — mirrored to Elasticsearch — for every
+        # invalid message in the backlog.
+        for message in reversed(messages):
+            payload = self._validated_payload(message, Insight)
+            if payload is not None and payload.get("symbol") == symbol:
                 return payload
         return None
 
@@ -506,12 +525,6 @@ class APIService:
 
     def unregister_stream(self, connection_id: str) -> None:
         self._stream_broker.unregister(connection_id)
-
-    async def _rows_for_tables(self, tables: Sequence[str]) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for table in tables:
-            rows.extend(await self._store.query_sql(f'SELECT * FROM "{table}"'))
-        return rows
 
     async def _cached_history(
         self,
@@ -549,33 +562,46 @@ class APIService:
             deduped[key] = row
         return list(deduped.values())
 
+    def _validated_payload(
+        self,
+        message: Any,
+        model: type[Signal] | type[Alert] | type[Insight],
+    ) -> dict[str, Any] | None:
+        """Validate one bus message, returning None (and logging) if it is bad."""
+        try:
+            return model.model_validate(message.body).model_dump(mode="json")
+        except Exception:
+            self._log.warning(
+                "api.invalid_message_skipped",
+                topic=getattr(message, "topic", "unknown"),
+                subscription=getattr(message, "subscription", self._subscription),
+                message_id=getattr(message, "message_id", ""),
+                model=model.__name__,
+            )
+            return None
+
     def _validated_payloads(
         self,
         messages: Sequence[Any],
         model: type[Signal] | type[Alert] | type[Insight],
     ) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = []
-        for message in messages:
-            try:
-                payloads.append(model.model_validate(message.body).model_dump(mode="json"))
-            except Exception:
-                self._log.warning(
-                    "api.invalid_message_skipped",
-                    topic=getattr(message, "topic", "unknown"),
-                    subscription=getattr(message, "subscription", self._subscription),
-                    message_id=getattr(message, "message_id", ""),
-                    model=model.__name__,
-                )
-        return payloads
+        payloads = (self._validated_payload(message, model) for message in messages)
+        return [payload for payload in payloads if payload is not None]
 
-    @staticmethod
-    def _normalise_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
-        if row is None:
-            return None
+    @classmethod
+    def _normalise_optional_row(cls, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        """``_normalise_row`` for call sites where the backend may return nothing."""
+        return None if row is None else cls._normalise_row(row)
+
+    @classmethod
+    def _normalise_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        """Emit a consistent ``ts`` regardless of which backend produced the row."""
         normalised = dict(row)
-        ts = normalised.get("ts")
+        ts = cls._row_timestamp(normalised)
         if hasattr(ts, "isoformat"):
-            normalised["ts"] = ts.isoformat()
+            ts = ts.isoformat()
+        if ts is not None:
+            normalised["ts"] = ts
         return normalised
 
     @staticmethod
@@ -585,7 +611,7 @@ class APIService:
         if isinstance(value, datetime):
             return value
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value, tz=timezone.utc)
+            return datetime.fromtimestamp(value, tz=UTC)
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -605,13 +631,29 @@ class APIService:
     def _normalise_datetime(value: datetime) -> datetime:
         if value.tzinfo is None:
             return value
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.astimezone(UTC).replace(tzinfo=None)
 
     @staticmethod
-    def _ts_sort_key(row: dict[str, Any]) -> tuple[int, str]:
-        ts = row.get("ts")
-        if hasattr(ts, "isoformat"):
-            return (1, ts.isoformat())
-        if ts is None:
-            return (0, "")
-        return (1, str(ts))
+    def _row_timestamp(row: dict[str, Any]) -> Any:
+        """
+        Read a row's timestamp under either column name.
+
+        Druid promotes the ingest ``timestampSpec`` column to ``__time``, so
+        rows read back from Druid carry ``__time`` where snapshot/cache rows
+        carry ``ts``. ``_cached_history`` and ``_dedupe_rows`` already accept
+        both; ordering and response shaping must too.
+        """
+        return row.get("ts") if row.get("ts") is not None else row.get("__time")
+
+    @classmethod
+    def _ts_sort_key(cls, row: dict[str, Any]) -> datetime:
+        """
+        Total ordering over rows from either backend.
+
+        The previous key read ``ts`` only and fell back to a constant, so every
+        sort and ``max()`` over Druid rows silently became a no-op — history
+        came back in arbitrary order and ``/indicators`` served whichever row
+        happened to be first rather than the latest.
+        """
+        ts = cls._parse_ts(cls._row_timestamp(row))
+        return cls._normalise_datetime(ts) if ts is not None else datetime.min

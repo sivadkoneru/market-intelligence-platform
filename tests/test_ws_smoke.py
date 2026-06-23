@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 
@@ -35,10 +36,10 @@ class _FakeWebSocket:
 
 
 class _FakeConnection:
-    def __init__(self, websocket: _FakeWebSocket) -> None:
+    def __init__(self, websocket: Any) -> None:
         self.websocket = websocket
 
-    async def __aenter__(self) -> _FakeWebSocket:
+    async def __aenter__(self) -> Any:
         return self.websocket
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

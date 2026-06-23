@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,35 @@ from libs.common.es import InMemorySearchStore, SearchStore
 CORRELATION_ID_HEADER = "X-Correlation-ID"
 TRACE_ID_HEADER = "X-Trace-ID"
 TRACEPARENT_HEADER = "traceparent"
+
+# Metric labels must come from a closed set. Both the request path and the
+# request method arrive from the wire, and every distinct value becomes a
+# permanent dict entry rendered into /metrics — so echoing them back unbounded
+# lets an unauthenticated caller grow the process's memory and the metrics
+# payload without limit.
+UNMATCHED_ROUTE = "<unmatched>"
+OTHER_METHOD = "<other>"
+KNOWN_HTTP_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+)
+
+
+def render_counters(prefix: str, counters: Mapping[str, Any]) -> list[str]:
+    """
+    Render ``name value`` counter lines with their Prometheus ``# TYPE`` headers.
+
+    Every service emitted these two lines by hand for each of its counters, so a
+    single metric cost two near-identical string literals that had to be kept in
+    sync by eye. Keys are metric-name suffixes (``messages_seen``), not field
+    names, because a few metrics are published under a different name than the
+    attribute holding them.
+    """
+    lines: list[str] = []
+    for name, value in counters.items():
+        metric = f"{prefix}_{name}"
+        lines.append(f"# TYPE {metric} counter")
+        lines.append(f"{metric} {value}")
+    return lines
 
 
 @dataclass
@@ -72,7 +102,8 @@ class HTTPMetrics:
             self.trace_context_provided_total += 1
         if correlation_context_provided:
             self.correlation_context_provided_total += 1
-        self.requests_by_method[method] = self.requests_by_method.get(method, 0) + 1
+        method_key = method if method in KNOWN_HTTP_METHODS else OTHER_METHOD
+        self.requests_by_method[method_key] = self.requests_by_method.get(method_key, 0) + 1
         self.requests_by_path[path] = self.requests_by_path.get(path, 0) + 1
         status_key = str(status_code)
         self.requests_by_status[status_key] = self.requests_by_status.get(status_key, 0) + 1
@@ -101,10 +132,56 @@ class HTTPMetrics:
             lines.append(f'{prefix}_http_requests_by_path_total{{path="{path}"}} {count}')
         lines.append(f"# TYPE {prefix}_http_requests_by_status_total counter")
         for status, count in sorted(self.requests_by_status.items()):
-            lines.append(
-                f'{prefix}_http_requests_by_status_total{{status="{status}"}} {count}'
-            )
+            lines.append(f'{prefix}_http_requests_by_status_total{{status="{status}"}} {count}')
         return lines
+
+
+@dataclass
+class ServiceMetrics:
+    """
+    Base for a service's metric counters.
+
+    Owns the HTTP counters and the delegating ``record_http_request`` that the
+    observability middleware calls. Every service repeated that pass-through
+    verbatim; inheriting it keeps the middleware contract in one place, so a
+    change to the recorded fields cannot land in four services and miss a fifth.
+
+    Subclasses add their own counters and implement ``render``.
+    """
+
+    http: HTTPMetrics = field(default_factory=HTTPMetrics)
+
+    def record_http_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        trace_context_provided: bool,
+        correlation_context_provided: bool,
+    ) -> None:
+        self.http.record_http_request(
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            trace_context_provided=trace_context_provided,
+            correlation_context_provided=correlation_context_provided,
+        )
+
+
+@dataclass
+class WorkerMetrics(ServiceMetrics):
+    """
+    Base for bus-consuming services.
+
+    Adds ``last_error``, which :func:`libs.common.resilience.run_poll_loop`
+    writes to when an iteration fails.
+    """
+
+    last_error: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # ContextVars for per-request / per-task context
@@ -112,12 +189,19 @@ class HTTPMetrics:
 
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 _trace_id: ContextVar[str | None] = ContextVar("trace_id", default=None)
-_extra_context: ContextVar[dict[str, Any]] = ContextVar("extra_context", default={})
+# Default is None, not {}: a mutable ContextVar default is one object shared by
+# every context that never calls .set(), so a single in-place write would leak
+# one request's fields into every other request's logs.
+_extra_context: ContextVar[dict[str, Any] | None] = ContextVar("extra_context", default=None)
 
 _configured = False
 _service_name = "market-intel"
 _log_index = "logs-market-intel"
 _search_store: SearchStore | None = None
+# Strong references to in-flight sink writes. asyncio only holds a weak
+# reference to a running task, so a fire-and-forget create_task() can be
+# garbage-collected mid-write and silently drop the log line.
+_pending_log_writes: set[asyncio.Task[None]] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +209,7 @@ _search_store: SearchStore | None = None
 # ---------------------------------------------------------------------------
 
 
-def _inject_context(
-    logger: Any, method: str, event_dict: dict[str, Any]
-) -> dict[str, Any]:
+def _inject_context(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Structlog processor: injects correlation/trace IDs and extra context into every event."""
     cid = _correlation_id.get()
     if cid is not None:
@@ -137,24 +219,21 @@ def _inject_context(
     if tid is not None:
         event_dict.setdefault("trace_id", tid)
 
-    extra = _extra_context.get()
-    for k, v in extra.items():
+    for k, v in (_extra_context.get() or {}).items():
         event_dict.setdefault(k, v)
 
     event_dict.setdefault("service", _service_name)
     return event_dict
 
 
-def _persist_event(
-    logger: Any, method: str, event_dict: dict[str, Any]
-) -> dict[str, Any]:
+def _persist_event(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Best-effort side effect: mirror structured logs into the configured search store."""
     if _search_store is None:
         return event_dict
 
     payload = dict(event_dict)
     if isinstance(_search_store, InMemorySearchStore):
-        _search_store._logs.setdefault(_log_index, []).append(payload)
+        _search_store.record_log(_log_index, payload)
         return event_dict
 
     try:
@@ -163,7 +242,9 @@ def _persist_event(
         asyncio.run(_index_log_safely(_search_store, _log_index, payload))
         return event_dict
 
-    loop.create_task(_index_log_safely(_search_store, _log_index, payload))
+    task = loop.create_task(_index_log_safely(_search_store, _log_index, payload))
+    _pending_log_writes.add(task)
+    task.add_done_callback(_pending_log_writes.discard)
     return event_dict
 
 
@@ -212,11 +293,18 @@ def _extract_correlation_id(request: Request) -> tuple[str, bool]:
 
 
 def _safe_route_path(request: Request) -> str:
+    """
+    Return the matched route *template* for use as a metric label.
+
+    Starlette only populates ``scope["route"]`` on a match, so 404s and failures
+    raised before routing have no template. Those collapse to a single sentinel
+    rather than the caller-supplied URL — see ``UNMATCHED_ROUTE``.
+    """
     route = request.scope.get("route")
     route_path = getattr(route, "path", None)
     if isinstance(route_path, str):
         return route_path
-    return request.url.path
+    return UNMATCHED_ROUTE
 
 
 def _record_request_metrics(
@@ -267,9 +355,7 @@ def configure_logging(
     if log_index:
         _log_index = log_index
     else:
-        _log_index = (
-            f"logs-{resolved_service_name.replace('_', '-').replace(' ', '-').lower()}"
-        )
+        _log_index = f"logs-{resolved_service_name.replace('_', '-').replace(' ', '-').lower()}"
     _search_store = search_store
 
     resolved_level = (level or "INFO").upper()
@@ -343,7 +429,7 @@ def bind_trace_id(value: str) -> None:
 
 def bind_context(**kwargs: Any) -> None:
     """Bind arbitrary key/value pairs into the current logging context."""
-    current = dict(_extra_context.get())
+    current = dict(_extra_context.get() or {})
     current.update(kwargs)
     _extra_context.set(current)
 
@@ -352,7 +438,7 @@ def reset_context() -> None:
     """Clear all bound context variables (useful between tests)."""
     _correlation_id.set(None)
     _trace_id.set(None)
-    _extra_context.set({})
+    _extra_context.set(None)
     structlog.contextvars.clear_contextvars()
 
 
@@ -384,7 +470,6 @@ def create_observability_middleware(
         request.state.trace_id = trace_id
 
         start = time.perf_counter()
-        route_path = request.url.path
         try:
             response = await call_next(request)
             route_path = _safe_route_path(request)

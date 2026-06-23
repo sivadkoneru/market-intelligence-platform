@@ -1,8 +1,9 @@
 """Tests for libs/common/schema.py — model validation, JSON round-trip, idempotency key."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from libs.common.schema import (
     TOPIC_ALERTS,
@@ -39,7 +40,7 @@ def test_topic_constants():
 def test_market_event_defaults_are_tz_aware():
     ev = MarketEvent(symbol="BTCUSDT", source="binance", event_type="trade", price=60_000.0)
     assert ev.ts.tzinfo is not None
-    assert ev.ts.tzinfo == timezone.utc
+    assert ev.ts.tzinfo == UTC
 
 
 def test_market_event_fields():
@@ -74,8 +75,10 @@ def test_market_event_has_event_id():
 
 
 def test_market_event_missing_required_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         MarketEvent(symbol="BTCUSDT", source="binance", event_type="trade")  # price missing
+
+    assert [error["loc"] for error in exc_info.value.errors()] == [("price",)]
 
 
 def test_market_event_json_roundtrip():
@@ -140,8 +143,10 @@ def test_news_event_with_optional_fields():
 
 
 def test_news_event_missing_required_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         NewsEvent(source="x", symbols=["X"])  # title + body missing
+
+    assert {error["loc"] for error in exc_info.value.errors()} == {("title",), ("body",)}
 
 
 def test_news_event_json_roundtrip():
@@ -193,8 +198,10 @@ def test_signal_json_roundtrip():
 
 
 def test_signal_missing_symbol_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         Signal(indicators={})  # symbol missing
+
+    assert [error["loc"] for error in exc_info.value.errors()] == [("symbol",)]
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +273,18 @@ def test_alert_valid():
 
 
 def test_alert_missing_required_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         Alert(symbol="X", rule="r")  # severity/message/dedupe_key missing
+
+    assert {error["loc"] for error in exc_info.value.errors()} == {
+        ("severity",),
+        ("message",),
+        ("dedupe_key",),
+    }
 
 
 def test_alert_json_roundtrip():
-    a = Alert(
-        symbol="X", rule="r", severity="low", message="msg", dedupe_key="key"
-    )
+    a = Alert(symbol="X", rule="r", severity="low", message="msg", dedupe_key="key")
     a2 = Alert.model_validate_json(a.model_dump_json())
     assert a2.dedupe_key == a.dedupe_key
     assert a2.ts == a.ts
@@ -286,35 +297,91 @@ def test_alert_json_roundtrip():
 
 
 def test_market_event_key_is_deterministic():
-    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
     k1 = market_event_key("BTCUSDT", ts, "binance")
     k2 = market_event_key("BTCUSDT", ts, "binance")
     assert k1 == k2
 
 
 def test_market_event_key_differs_on_symbol():
-    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert market_event_key("BTCUSDT", ts, "binance") != market_event_key(
-        "ETHUSD", ts, "binance"
-    )
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    assert market_event_key("BTCUSDT", ts, "binance") != market_event_key("ETHUSD", ts, "binance")
 
 
 def test_market_event_key_differs_on_ts():
-    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    ts2 = datetime(2024, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    ts2 = datetime(2024, 1, 1, 12, 0, 1, tzinfo=UTC)
     assert market_event_key("BTCUSDT", ts1, "binance") != market_event_key(
         "BTCUSDT", ts2, "binance"
     )
 
 
 def test_market_event_key_differs_on_source():
-    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert market_event_key("BTCUSDT", ts, "binance") != market_event_key(
-        "BTCUSDT", ts, "coinbase"
-    )
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    assert market_event_key("BTCUSDT", ts, "binance") != market_event_key("BTCUSDT", ts, "coinbase")
 
 
 def test_market_event_key_is_string():
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    ts = datetime(2024, 1, 1, tzinfo=UTC)
     k = market_event_key("X", ts, "y")
     assert isinstance(k, str) and len(k) > 0
+
+
+# ---------------------------------------------------------------------------
+# validation_reason
+# ---------------------------------------------------------------------------
+
+
+def _market_validation_error():
+    from pydantic import ValidationError
+
+    from libs.common.schema import MarketEvent
+
+    try:
+        MarketEvent.model_validate({"symbol": "BTCUSDT", "source": "x", "event_type": "trade"})
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("payload should not have validated")
+
+
+def test_validation_reason_keeps_the_prefix_and_the_failing_field():
+    from libs.common.schema import validation_reason
+
+    reason = validation_reason("invalid market event payload", _market_validation_error())
+
+    assert reason.startswith("invalid market event payload: ")
+    assert "price" in reason
+
+
+def test_validation_reason_excludes_the_offending_input():
+    """errors() embeds the input, which would mirror hostile payloads into logs."""
+    from pydantic import ValidationError
+
+    from libs.common.schema import MarketEvent, validation_reason
+
+    secret = "S3CRET" * 200
+    try:
+        MarketEvent.model_validate(
+            {"symbol": "BTCUSDT", "source": "x", "event_type": "trade", "price": secret}
+        )
+    except ValidationError as exc:
+        reason = validation_reason("invalid market event payload", exc)
+
+    assert "S3CRET" not in reason
+
+
+def test_validation_reason_is_bounded():
+    from pydantic import ValidationError
+
+    from libs.common.schema import (
+        MAX_DEAD_LETTER_REASON_CHARS,
+        NewsEvent,
+        validation_reason,
+    )
+
+    try:
+        NewsEvent.model_validate({"symbols": [{"bad": i} for i in range(500)]})
+    except ValidationError as exc:
+        reason = validation_reason("invalid news event payload", exc)
+
+    assert len(reason) <= MAX_DEAD_LETTER_REASON_CHARS + len("invalid news event payload: ") + 32

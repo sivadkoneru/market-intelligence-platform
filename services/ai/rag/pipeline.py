@@ -63,7 +63,8 @@ def rerank_retrieved_chunks(
     reranked: list[RetrievedChunk] = []
     for row in rows:
         chunk = ChunkDocument.from_search_result(row)
-        knn_score = float(row.get("_score", 0.0))
+        raw_score = row.get("_score", 0.0)
+        knn_score = float(raw_score) if isinstance(raw_score, (int, float)) else 0.0
         lexical_score = lexical_overlap_score(query, chunk)
         ranking_score = knn_score + (lexical_score * lexical_weight)
         reranked.append(

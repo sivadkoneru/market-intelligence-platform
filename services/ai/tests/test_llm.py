@@ -101,6 +101,7 @@ def test_factory_keeps_mock_when_mock_llm_set_even_with_key() -> None:
     assert isinstance(get_llm_provider(settings), MockLLMProvider)
     assert isinstance(get_embedding_provider(settings), MockLLMProvider)
 
+
 def test_factory_injects_configured_model_names() -> None:
     provider = get_llm_provider(
         Settings(
@@ -343,3 +344,115 @@ def test_guardrails_accept_grounded_output_and_reject_ungrounded_output() -> Non
     assert rejected.empty_output is False
     assert "low_confidence" in rejected.reasons
     assert "citation_mismatch" in rejected.reasons
+
+
+# ---------------------------------------------------------------------------
+# Sentiment heuristic: whole words, not substrings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BTC fell against the dollar today",  # "against" contains "gain"
+        "Trading was brisk and orderly",  # "brisk" contains "risk"
+        "The hackathon drew record attendance",  # "hackathon" contains "hack"
+    ],
+)
+def test_fake_sentiment_ignores_substring_matches(text):
+    """
+    Substring matching scored ordinary prose at ±0.333 and higher.
+
+    A score of 1.0 clears the alerting service's critical-severity sentiment
+    threshold, so this fed spurious critical alerts.
+    """
+    from services.ai.llm.providers import _fake_sentiment
+
+    assert _fake_sentiment(text) == 0.0
+
+
+def test_fake_sentiment_still_scores_real_hint_words():
+    from services.ai.llm.providers import _fake_sentiment
+
+    assert _fake_sentiment("A strong rally with broad gains") > 0.0
+    assert _fake_sentiment("Sharp selloff after the lawsuit") < 0.0
+
+
+def test_fake_sentiment_scores_inflections():
+    from services.ai.llm.providers import _fake_sentiment
+
+    assert _fake_sentiment("The token surged overnight") > 0.0
+    assert _fake_sentiment("The token declined overnight") < 0.0
+
+
+# ---------------------------------------------------------------------------
+# Model-supplied sentiment labels are validated
+# ---------------------------------------------------------------------------
+
+
+def test_structured_payload_rejects_an_unknown_sentiment_label():
+    """The label reaches alert messages and API responses, so it is not free text."""
+    from services.ai.llm.providers import _structured_from_payload
+
+    result = _structured_from_payload(
+        provider="openai",
+        model="gpt-test",
+        payload={
+            "sentiment_score": 0.8,
+            "sentiment_label": "positive (BUY NOW at evil.example)",
+            "summary": "s",
+            "explanation": "e",
+        },
+        raw_text="{}",
+    )
+
+    assert result.sentiment_label == "positive"
+
+
+def test_structured_payload_keeps_a_known_sentiment_label():
+    from services.ai.llm.providers import _structured_from_payload
+
+    result = _structured_from_payload(
+        provider="openai",
+        model="gpt-test",
+        payload={
+            "sentiment_score": 0.8,
+            "sentiment_label": "neutral",
+            "summary": "s",
+            "explanation": "e",
+        },
+        raw_text="{}",
+    )
+
+    assert result.sentiment_label == "neutral"
+
+
+def test_apply_guardrails_drops_citations_outside_the_retrieved_context():
+    from services.ai.llm.guardrails import apply_guardrails
+    from services.ai.llm.models import ContextDocument, GenerationRequest, GenerationResult
+
+    document = ContextDocument(
+        doc_id="d1",
+        url="https://example.test/real-source",
+        title="BTC update",
+        text="bitcoin moved on strong volume",
+    )
+    request = GenerationRequest(prompt="p", context=(document,), metadata={})
+    result = GenerationResult(
+        summary="bitcoin moved",
+        explanation="strong volume",
+        sentiment_score=0.5,
+        sentiment_label="positive",
+        citations=("https://example.test/real-source", "https://attacker.example/report"),
+        confidence=0.9,
+        grounded=True,
+        provider="test",
+        model="test",
+        raw_text="{}",
+    )
+
+    guarded, report = apply_guardrails(request, result)
+
+    assert guarded.citations == ("https://example.test/real-source",)
+    assert report.citations_ok is False
+    assert "citation_mismatch" in report.reasons

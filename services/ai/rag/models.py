@@ -69,7 +69,7 @@ class ChunkDocument:
         }
 
     @classmethod
-    def from_search_result(cls, row: dict[str, Any]) -> "ChunkDocument":
+    def from_search_result(cls, row: dict[str, Any]) -> ChunkDocument:
         """Normalize a SearchStore row into a chunk model."""
         metadata = dict(row.get("metadata") or {})
         citation = row.get("citation")

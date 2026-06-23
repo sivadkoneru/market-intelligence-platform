@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -21,6 +21,16 @@ from services.api.service import API_SUBSCRIPTION, API_WS_SUBSCRIPTION, APIServi
 class NoPrimeBus:
     def __init__(self) -> None:
         self.zero_message_receives: list[tuple[str, str]] = []
+
+    async def publish(
+        self,
+        topic: str,
+        body: dict[str, Any],
+        *,
+        message_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
+        return None
 
     async def receive(
         self,
@@ -80,7 +90,7 @@ class LatestFailingStore(InMemoryTimeSeriesStore):
 
 
 def _seed_store(store: InMemoryTimeSeriesStore) -> None:
-    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     rows = [
         {
             "_table": "ticks",
@@ -147,7 +157,7 @@ def _seed_bus_and_cache(bus: InMemoryBus, cache: InMemoryCache) -> None:
             "signals",
             {
                 "event_id": "sig-1",
-                "ts": datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 1, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "source": "stream",
                 "indicators": {
@@ -165,7 +175,7 @@ def _seed_bus_and_cache(bus: InMemoryBus, cache: InMemoryCache) -> None:
             "alerts",
             {
                 "event_id": "alt-1",
-                "ts": datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 2, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "rule": "rsi-threshold",
                 "severity": "medium",
@@ -178,7 +188,7 @@ def _seed_bus_and_cache(bus: InMemoryBus, cache: InMemoryCache) -> None:
             "BTCUSDT",
             {
                 "symbol": "BTCUSDT",
-                "ts": datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 1, tzinfo=UTC).isoformat(),
                 "source": "replay.binance",
                 "price": 100250.0,
                 "sma": 99950.0,
@@ -196,7 +206,7 @@ def _seed_bus_and_cache(bus: InMemoryBus, cache: InMemoryCache) -> None:
             "insight:BTCUSDT",
             {
                 "event_id": "ins-1",
-                "ts": datetime(2026, 1, 1, 0, 3, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 3, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "sentiment_score": 0.72,
                 "sentiment_label": "positive",
@@ -215,7 +225,7 @@ def _seed_bus_and_cache(bus: InMemoryBus, cache: InMemoryCache) -> None:
 def _insight_payload(event_id: str, symbol: str) -> dict[str, object]:
     return {
         "event_id": event_id,
-        "ts": datetime(2026, 1, 1, 0, 3, tzinfo=timezone.utc).isoformat(),
+        "ts": datetime(2026, 1, 1, 0, 3, tzinfo=UTC).isoformat(),
         "symbol": symbol,
         "sentiment_score": 0.72,
         "sentiment_label": "positive",
@@ -272,8 +282,8 @@ def test_api_routes_return_populated_market_indicator_and_insight_payloads() -> 
 
 
 def test_api_routes_return_symbols_history_signals_alerts_and_metrics() -> None:
-    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc).isoformat()
-    end = datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc).isoformat()
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=UTC).isoformat()
+    end = datetime(2026, 1, 1, 0, 2, tzinfo=UTC).isoformat()
 
     with _build_test_app() as client:
         root = client.get("/")
@@ -354,10 +364,14 @@ def test_symbols_skips_missing_indicator_datasource() -> None:
     bus = InMemoryBus()
     cache = InMemoryCache()
     store = SymbolQueryRecordingStore()
-    asyncio.run(store.ingest([
-        {"_table": "ticks", "symbol": "SOLUSDT", "ts": "2026-01-01T00:00:00Z"},
-        {"_table": "ticks", "symbol": "BTCUSDT", "ts": "2026-01-01T00:01:00Z"},
-    ]))
+    asyncio.run(
+        store.ingest(
+            [
+                {"_table": "ticks", "symbol": "SOLUSDT", "ts": "2026-01-01T00:00:00Z"},
+                {"_table": "ticks", "symbol": "BTCUSDT", "ts": "2026-01-01T00:01:00Z"},
+            ]
+        )
+    )
 
     with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
         response = client.get("/symbols")
@@ -407,19 +421,21 @@ def test_latest_market_uses_cached_snapshot_before_druid() -> None:
     bus = InMemoryBus()
     cache = InMemoryCache()
     store = LatestFailingStore()
-    asyncio.run(cache.set_snapshot(
-        "BTCUSDT",
-        {
-            "symbol": "BTCUSDT",
-            "ts": "2026-01-01T00:00:00Z",
-            "source": "seed.local",
-            "event_type": "trade",
-            "price": 42000.0,
-            "volume": 1.0,
-            "bid": 41999.75,
-            "ask": 42000.25,
-        },
-    ))
+    asyncio.run(
+        cache.set_snapshot(
+            "BTCUSDT",
+            {
+                "symbol": "BTCUSDT",
+                "ts": "2026-01-01T00:00:00Z",
+                "source": "seed.local",
+                "event_type": "trade",
+                "price": 42000.0,
+                "volume": 1.0,
+                "bid": 41999.75,
+                "ask": 42000.25,
+            },
+        )
+    )
 
     with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
         response = client.get("/market/BTCUSDT/latest")
@@ -560,7 +576,7 @@ def test_signals_and_alerts_skip_invalid_bus_payloads() -> None:
             "signals",
             {
                 "event_id": "sig-1",
-                "ts": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "source": "stream",
                 "indicators": {"rsi": 66.5},
@@ -573,7 +589,7 @@ def test_signals_and_alerts_skip_invalid_bus_payloads() -> None:
             "alerts",
             {
                 "event_id": "alert-1",
-                "ts": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "rule": "rsi_overbought",
                 "severity": "high",
@@ -605,8 +621,8 @@ def test_api_returns_404s_and_validates_history_range() -> None:
         bad_history = client.get(
             "/market/BTCUSDT/history",
             params={
-                "from": datetime(2026, 1, 1, 0, 3, tzinfo=timezone.utc).isoformat(),
-                "to": datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc).isoformat(),
+                "from": datetime(2026, 1, 1, 0, 3, tzinfo=UTC).isoformat(),
+                "to": datetime(2026, 1, 1, 0, 2, tzinfo=UTC).isoformat(),
             },
         )
 
@@ -617,14 +633,16 @@ def test_api_returns_404s_and_validates_history_range() -> None:
 
 
 def test_ws_stream_validates_subscribe_payloads() -> None:
-    with _build_ws_test_context()[0] as client:
-        with client.websocket_connect("/ws/stream") as websocket:
-            websocket.send_json({"action": "follow", "symbols": ["BTCUSDT"]})
-            invalid_action = websocket.receive_json()
-            websocket.send_json({"action": "subscribe", "symbols": ["", " "]})
-            invalid_symbols = websocket.receive_json()
-            websocket.send_json({"action": "subscribe", "symbols": ["btcusdt"]})
-            valid = websocket.receive_json()
+    with (
+        _build_ws_test_context()[0] as client,
+        client.websocket_connect("/ws/stream") as websocket,
+    ):
+        websocket.send_json({"action": "follow", "symbols": ["BTCUSDT"]})
+        invalid_action = websocket.receive_json()
+        websocket.send_json({"action": "subscribe", "symbols": ["", " "]})
+        invalid_symbols = websocket.receive_json()
+        websocket.send_json({"action": "subscribe", "symbols": ["btcusdt"]})
+        valid = websocket.receive_json()
 
     assert invalid_action["type"] == "error"
     assert "subscribe" in invalid_action["detail"]
@@ -643,7 +661,7 @@ def test_ws_stream_filters_by_symbol_and_fans_out_across_topics() -> None:
             TOPIC_MARKET_RAW,
             {
                 "event_id": "mkt-1",
-                "ts": datetime(2026, 1, 1, 0, 4, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 4, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "source": "replay.binance",
                 "event_type": "trade",
@@ -656,7 +674,7 @@ def test_ws_stream_filters_by_symbol_and_fans_out_across_topics() -> None:
             TOPIC_SIGNALS,
             {
                 "event_id": "sig-eth",
-                "ts": datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 5, tzinfo=UTC).isoformat(),
                 "symbol": "ETHUSDT",
                 "source": "stream",
                 "indicators": {"rsi": 51.2},
@@ -668,7 +686,7 @@ def test_ws_stream_filters_by_symbol_and_fans_out_across_topics() -> None:
             TOPIC_ALERTS,
             {
                 "event_id": "alt-2",
-                "ts": datetime(2026, 1, 1, 0, 6, tzinfo=timezone.utc).isoformat(),
+                "ts": datetime(2026, 1, 1, 0, 6, tzinfo=UTC).isoformat(),
                 "symbol": "BTCUSDT",
                 "rule": "breakout",
                 "severity": "high",
@@ -683,14 +701,13 @@ def test_ws_stream_filters_by_symbol_and_fans_out_across_topics() -> None:
             message_id="ins-2",
         )
 
-    with client:
-        with client.websocket_connect("/ws/stream") as websocket:
-            websocket.send_json({"action": "subscribe", "symbols": ["BTCUSDT"]})
-            assert websocket.receive_json() == {"type": "subscribed", "symbols": ["BTCUSDT"]}
+    with client, client.websocket_connect("/ws/stream") as websocket:
+        websocket.send_json({"action": "subscribe", "symbols": ["BTCUSDT"]})
+        assert websocket.receive_json() == {"type": "subscribed", "symbols": ["BTCUSDT"]}
 
-            asyncio.run(publish())
+        asyncio.run(publish())
 
-            received = [websocket.receive_json() for _ in range(3)]
+        received = [websocket.receive_json() for _ in range(3)]
 
     assert {message["type"] for message in received} == {"market", "alert", "insight"}
     assert all(message["symbol"] == "BTCUSDT" for message in received)
@@ -761,3 +778,447 @@ def test_app_lifespan_closes_real_backends() -> None:
 
     assert bus.closed is True
     assert cache.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Druid-shaped rows (__time instead of ts)
+# ---------------------------------------------------------------------------
+
+
+def _druid_row(event_id: str, iso_ts: str, **extra: Any) -> dict[str, Any]:
+    """A row as Druid returns it: the ingest `ts` column is promoted to `__time`."""
+    return {"__time": iso_ts, "event_id": event_id, "symbol": "BTCUSDT", **extra}
+
+
+def test_market_history_orders_druid_rows_by_time() -> None:
+    store = InMemoryTimeSeriesStore()
+    service = APIService(store=store, cache=InMemoryCache(), bus=InMemoryBus())
+    rows = [
+        _druid_row("d2", "2026-01-01T00:00:02+00:00", price=2.0),
+        _druid_row("d1", "2026-01-01T00:00:01+00:00", price=1.0),
+        _druid_row("d3", "2026-01-01T00:00:03+00:00", price=3.0),
+    ]
+
+    ordered = sorted(rows, key=service._ts_sort_key)
+
+    assert [row["event_id"] for row in ordered] == ["d1", "d2", "d3"]
+
+
+def test_normalise_row_exposes_druid_time_as_ts() -> None:
+    """Cache-hit and Druid-fallback responses must have the same shape."""
+    service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=InMemoryBus())
+
+    normalised = service._normalise_row(_druid_row("d1", "2026-01-01T00:00:01+00:00", price=1.0))
+
+    assert normalised["ts"] == "2026-01-01T00:00:01+00:00"
+
+
+def test_ts_sort_key_picks_the_latest_druid_row() -> None:
+    service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=InMemoryBus())
+    matches = [
+        _druid_row("old", "2026-01-01T00:00:01+00:00", rsi=11.0),
+        _druid_row("new", "2026-01-01T00:00:09+00:00", rsi=99.0),
+    ]
+
+    assert max(matches, key=service._ts_sort_key)["rsi"] == 99.0
+
+
+# ---------------------------------------------------------------------------
+# Stream broker resource bounds and lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_stream_queue_drops_oldest_instead_of_growing_without_bound() -> None:
+    import asyncio
+
+    from services.api.service import MAX_STREAM_QUEUE_SIZE, LiveStreamBroker, StreamEnvelope
+
+    async def scenario() -> tuple[int, int]:
+        broker = LiveStreamBroker(bus=InMemoryBus())
+        queue = broker.register("c1")
+        broker.update_symbols("c1", ["BTCUSDT"])
+        # A client that never reads.
+        for index in range(MAX_STREAM_QUEUE_SIZE + 25):
+            await broker._fanout(
+                StreamEnvelope(
+                    topic=TOPIC_MARKET_RAW,
+                    event="market",
+                    symbol="BTCUSDT",
+                    payload={"symbol": "BTCUSDT", "seq": index},
+                )
+            )
+        return queue.qsize(), broker.dropped_stream_messages
+
+    qsize, dropped = asyncio.run(scenario())
+
+    assert qsize == MAX_STREAM_QUEUE_SIZE
+    assert dropped == 25
+
+
+def test_stream_queue_keeps_the_newest_messages() -> None:
+    import asyncio
+
+    from services.api.service import MAX_STREAM_QUEUE_SIZE, LiveStreamBroker, StreamEnvelope
+
+    async def scenario() -> dict[str, Any]:
+        broker = LiveStreamBroker(bus=InMemoryBus())
+        queue = broker.register("c1")
+        broker.update_symbols("c1", ["BTCUSDT"])
+        for index in range(MAX_STREAM_QUEUE_SIZE + 1):
+            await broker._fanout(
+                StreamEnvelope(
+                    topic=TOPIC_MARKET_RAW,
+                    event="market",
+                    symbol="BTCUSDT",
+                    payload={"symbol": "BTCUSDT", "seq": index},
+                )
+            )
+        return queue.get_nowait()
+
+    oldest_retained = asyncio.run(scenario())
+
+    assert oldest_retained["payload"]["seq"] == 1
+
+
+def test_update_symbols_for_an_unregistered_connection_raises_value_error() -> None:
+    """ws.py catches ValueError; a KeyError would escape and kill the socket."""
+    import pytest
+
+    from services.api.service import LiveStreamBroker
+
+    broker = LiveStreamBroker(bus=InMemoryBus())
+
+    with pytest.raises(ValueError, match="no longer registered"):
+        broker.update_symbols("never-registered", ["BTCUSDT"])
+
+
+def test_api_service_close_releases_every_backend_when_one_fails() -> None:
+    import asyncio
+
+    class FailingCache(InMemoryCache):
+        async def close(self) -> None:
+            raise RuntimeError("redis down")
+
+    class RecordingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    bus = RecordingBus()
+    service = APIService(store=InMemoryTimeSeriesStore(), cache=FailingCache(), bus=bus)
+
+    asyncio.run(service.close())
+
+    assert bus.closed is True
+
+
+def test_websocket_stream_reports_an_error_for_a_non_json_frame() -> None:
+    """A malformed frame must produce an error frame, not an unhandled crash."""
+    store = InMemoryTimeSeriesStore()
+    service = APIService(store=store, cache=InMemoryCache(), bus=InMemoryBus())
+
+    with (
+        TestClient(create_app(service)) as client,
+        client.websocket_connect("/ws/stream") as websocket,
+    ):
+        websocket.send_text("this-is-not-json")
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+
+        # The connection survives and still accepts a valid command.
+        websocket.send_json({"action": "subscribe", "symbols": ["BTCUSDT"]})
+        assert websocket.receive_json() == {
+            "type": "subscribed",
+            "symbols": ["BTCUSDT"],
+        }
+
+
+def test_websocket_stream_rejects_an_oversized_symbol_list() -> None:
+    from services.api.ws import MAX_SUBSCRIBED_SYMBOLS
+
+    service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=InMemoryBus())
+
+    with (
+        TestClient(create_app(service)) as client,
+        client.websocket_connect("/ws/stream") as websocket,
+    ):
+        websocket.send_json(
+            {
+                "action": "subscribe",
+                "symbols": [f"SYM{i}" for i in range(MAX_SUBSCRIBED_SYMBOLS + 1)],
+            }
+        )
+        assert websocket.receive_json()["type"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Peek-based read model returns the NEWEST messages
+# ---------------------------------------------------------------------------
+
+
+def _signal_body(seq: int) -> dict[str, Any]:
+    return {
+        "event_id": f"sig-{seq:04d}",
+        "ts": (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=seq)).isoformat(),
+        "symbol": "BTCUSDT",
+        "source": "stream",
+        "indicators": {"sma": float(seq)},
+        "anomaly": False,
+    }
+
+
+def test_signals_returns_the_newest_messages_not_the_oldest() -> None:
+    """
+    peek() reads from the head of the subscription.
+
+    Slicing the front returned the same oldest N forever, so a running platform
+    served a frozen window while claiming to show the latest signals.
+    """
+    import asyncio
+
+    async def scenario() -> list[dict[str, Any]]:
+        bus = InMemoryBus()
+        await bus.receive(TOPIC_SIGNALS, API_SUBSCRIPTION, max_messages=0)
+        service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=bus)
+        for seq in range(30):
+            await bus.publish(TOPIC_SIGNALS, _signal_body(seq), message_id=f"sig-{seq}")
+        return await service.signals(limit=5)
+
+    payloads = asyncio.run(scenario())
+
+    assert [p["event_id"] for p in payloads] == [
+        "sig-0029",
+        "sig-0028",
+        "sig-0027",
+        "sig-0026",
+        "sig-0025",
+    ]
+
+
+def test_signals_advance_as_new_messages_arrive() -> None:
+    import asyncio
+
+    async def scenario() -> tuple[str, str]:
+        bus = InMemoryBus()
+        await bus.receive(TOPIC_SIGNALS, API_SUBSCRIPTION, max_messages=0)
+        service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=bus)
+        for seq in range(30):
+            await bus.publish(TOPIC_SIGNALS, _signal_body(seq), message_id=f"sig-{seq}")
+        first = (await service.signals(limit=3))[0]["event_id"]
+
+        for seq in range(30, 40):
+            await bus.publish(TOPIC_SIGNALS, _signal_body(seq), message_id=f"sig-{seq}")
+        second = (await service.signals(limit=3))[0]["event_id"]
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == "sig-0029"
+    assert second == "sig-0039"
+
+
+class CountingAPIService(APIService):
+    """APIService that records how many bus messages it validated."""
+
+    validated_count = 0
+
+    def _validated_payload(self, message, model):
+        self.validated_count += 1
+        return super()._validated_payload(message, model)
+
+
+def test_insight_stops_validating_once_the_symbol_matches() -> None:
+    """Eagerly validating the whole window cost a full Pydantic pass per request."""
+    import asyncio
+
+    async def scenario() -> tuple[dict[str, Any] | None, int]:
+        bus = InMemoryBus()
+        await bus.receive(TOPIC_INSIGHTS, API_SUBSCRIPTION, max_messages=0)
+        service = CountingAPIService(
+            store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=bus
+        )
+        for seq in range(50):
+            await bus.publish(
+                TOPIC_INSIGHTS,
+                {
+                    "event_id": f"ins-{seq}",
+                    "ts": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+                    "symbol": "BTCUSDT",
+                    "sentiment_score": 0.5,
+                    "sentiment_label": "positive",
+                    "summary": "s",
+                    "explanation": "e",
+                    "citations": [],
+                    "confidence": 0.8,
+                    "grounded": True,
+                    "model": "mock",
+                },
+                message_id=f"ins-{seq}",
+            )
+
+        return await service.insight("BTCUSDT"), service.validated_count
+
+    payload, validated = asyncio.run(scenario())
+
+    assert payload is not None
+    assert payload["event_id"] == "ins-49", "should return the most recent insight"
+    assert validated == 1, "the newest message matched, so nothing else needed validating"
+
+
+# ---------------------------------------------------------------------------
+# Symbol validation and normalization
+# ---------------------------------------------------------------------------
+
+
+def _client_with_snapshot() -> TestClient:
+    cache = InMemoryCache()
+    service = APIService(store=InMemoryTimeSeriesStore(), cache=cache, bus=InMemoryBus())
+    import asyncio
+
+    asyncio.run(
+        cache.set_snapshot(
+            "BTCUSDT",
+            {
+                "symbol": "BTCUSDT",
+                "ts": "2026-01-01T00:00:00+00:00",
+                "source": "binance",
+                "event_type": "trade",
+                "price": 42000.0,
+                "sma": 1.0,
+                "trend_score": 1.0,
+            },
+        )
+    )
+    return TestClient(create_app(service))
+
+
+def test_lowercase_symbol_resolves_to_the_same_data_as_uppercase() -> None:
+    """The websocket path uppercases; REST used to 404 on data WS streamed fine."""
+    with _client_with_snapshot() as client:
+        upper = client.get("/market/BTCUSDT/latest")
+        lower = client.get("/market/btcusdt/latest")
+
+    assert upper.status_code == 200
+    assert lower.status_code == 200
+    assert lower.json()["price"] == upper.json()["price"]
+
+
+def test_indicators_accept_lowercase_symbols() -> None:
+    with _client_with_snapshot() as client:
+        assert client.get("/indicators/btcusdt").status_code == 200
+
+
+def test_oversized_symbol_is_rejected_before_reaching_a_backend() -> None:
+    with _client_with_snapshot() as client:
+        response = client.get(f"/market/{'A' * 200}/latest")
+
+    assert response.status_code == 422
+
+
+def test_symbol_with_illegal_characters_is_rejected() -> None:
+    with _client_with_snapshot() as client:
+        assert client.get("/market/BTC'USDT/latest").status_code == 422
+
+
+def test_404_detail_echoes_the_normalized_symbol() -> None:
+    with _client_with_snapshot() as client:
+        response = client.get("/insights/ethusdt")
+
+    assert response.status_code == 404
+    assert "ETHUSDT" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Query bounds
+# ---------------------------------------------------------------------------
+
+
+def test_history_limit_is_capped_and_returns_the_newest_rows() -> None:
+    import asyncio
+
+    from services.api.routes.market import MAX_HISTORY_ROWS
+
+    store = InMemoryTimeSeriesStore()
+    service = APIService(store=store, cache=InMemoryCache(), bus=InMemoryBus())
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    asyncio.run(
+        store.ingest(
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "ts": (base + timedelta(seconds=i)).isoformat(),
+                    "price": float(i),
+                    "event_id": f"tick-{i}",
+                }
+                for i in range(50)
+            ]
+        )
+    )
+
+    rows = asyncio.run(
+        service.market_history("BTCUSDT", frm=base, to=base + timedelta(hours=1), limit=5)
+    )
+
+    assert len(rows) == 5
+    assert [r["event_id"] for r in rows] == [f"tick-{i}" for i in range(45, 50)]
+    assert MAX_HISTORY_ROWS == 10_000
+
+
+def test_history_limit_above_the_cap_is_rejected() -> None:
+    with _client_with_snapshot() as client:
+        response = client.get(
+            "/market/BTCUSDT/history",
+            params={"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "limit": 10_001},
+        )
+
+    assert response.status_code == 422
+
+
+def test_indicators_fallback_queries_only_the_matching_symbol() -> None:
+    """The fallback used to SELECT * the whole indicators table and filter in Python."""
+    import asyncio
+
+    class RecordingStore(InMemoryTimeSeriesStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sql_queries: list[str] = []
+
+        async def query_sql(self, sql: str):
+            self.sql_queries.append(sql)
+            return await super().query_sql(sql)
+
+    store = RecordingStore()
+    service = APIService(store=store, cache=InMemoryCache(), bus=InMemoryBus())
+    asyncio.run(
+        store.ingest(
+            [
+                {
+                    "_table": "indicators",
+                    "symbol": "BTCUSDT",
+                    "ts": "2026-01-01T00:00:01+00:00",
+                    "rsi": 11.0,
+                },
+                {
+                    "_table": "indicators",
+                    "symbol": "BTCUSDT",
+                    "ts": "2026-01-01T00:00:09+00:00",
+                    "rsi": 99.0,
+                },
+                {
+                    "_table": "indicators",
+                    "symbol": "ETHUSDT",
+                    "ts": "2026-01-01T00:00:09+00:00",
+                    "rsi": 50.0,
+                },
+            ]
+        )
+    )
+
+    payload = asyncio.run(service.indicators("BTCUSDT"))
+
+    assert payload is not None
+    assert payload["indicators"]["rsi"] == 99.0, "must return the latest row, not the first"
+    assert store.sql_queries == [], "no unfiltered table scan should be issued"
