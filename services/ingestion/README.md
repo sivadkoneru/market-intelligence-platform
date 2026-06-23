@@ -12,6 +12,7 @@ This service is offline-safe for CI and local tests:
 - deterministic replay feed for repeatable runs
 - `InMemoryBus` support for zero-network tests
 - FastAPI `/health` and `/metrics` endpoints
+- FastAPI `POST /mock/news` endpoint for local AI insight smoke data
 - app lifespan starts the replay ingestion loop by default
 - structured logging via `libs.common.get_logger`
 
@@ -68,6 +69,17 @@ Run the service with Uvicorn:
 ```bash
 uvicorn services.ingestion.app:app --host 0.0.0.0 --port 8001
 ```
+
+Publish a mock news event for the AI pipeline:
+
+```bash
+curl -X POST http://localhost:8001/mock/news \
+  -H 'Content-Type: application/json' \
+  -d '{"symbols":["BTCUSDT"],"title":"BTC ETF inflows improve","body":"BTC sentiment is constructive in this local mock news item."}'
+```
+
+The endpoint publishes a valid `NewsEvent` to `news.raw`. Once `ai-analysis`
+consumes it, read the result through the API with `GET /insights/BTCUSDT`.
 
 ## Dependencies
 

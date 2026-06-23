@@ -18,6 +18,7 @@ def test_ai_requirements_are_pinned() -> None:
     assert "azure-servicebus==7.14.3" in lines
     assert "elasticsearch==8.17.0" in lines
     assert "tenacity==9.0.0" in lines
+    assert "openai==1.59.6" in lines
 
 
 def test_ai_dockerfile_uses_runtime_pattern() -> None:

@@ -11,8 +11,10 @@ from typing import Any
 
 from libs.common import (
     TOPIC_MARKET_RAW,
+    TOPIC_NEWS_RAW,
     HTTPMetrics,
     MessageBus,
+    NewsEvent,
     get_logger,
     market_event_key,
 )
@@ -28,6 +30,7 @@ class IngestionMetrics:
     events_normalized: int = 0
     publish_attempts: int = 0
     unique_publishes: int = 0
+    news_publishes: int = 0
     duplicate_events: int = 0
     reconnects: int = 0
     disconnects: int = 0
@@ -64,6 +67,8 @@ class IngestionMetrics:
             f"ingestion_publish_attempts {self.publish_attempts}",
             "# TYPE ingestion_unique_publishes counter",
             f"ingestion_unique_publishes {self.unique_publishes}",
+            "# TYPE ingestion_news_publishes counter",
+            f"ingestion_news_publishes {self.news_publishes}",
             "# TYPE ingestion_duplicate_events counter",
             f"ingestion_duplicate_events {self.duplicate_events}",
             "# TYPE ingestion_reconnects counter",
@@ -82,11 +87,13 @@ class IngestionService:
         bus: MessageBus,
         feed_factory: ReplayFeedFactory,
         topic: str = TOPIC_MARKET_RAW,
+        news_topic: str = TOPIC_NEWS_RAW,
         reconnect_backoff_seconds: float = 0.01,
     ) -> None:
         self._bus = bus
         self._feed_factory = feed_factory
         self._topic = topic
+        self._news_topic = news_topic
         self._reconnect_backoff_seconds = reconnect_backoff_seconds
         self.metrics = IngestionMetrics()
         self._log = get_logger(__name__)
@@ -156,6 +163,26 @@ class IngestionService:
             "status": "ok",
             "service": "ingestion",
             "topic": self._topic,
+            "news_topic": self._news_topic,
             "events_seen": self.metrics.events_seen,
             "reconnects": self.metrics.reconnects,
         }
+
+    async def publish_news_event(self, event: NewsEvent) -> str:
+        message_id = event.event_id
+        self.metrics.publish_attempts += 1
+        self.metrics.news_publishes += 1
+        await self._bus.publish(
+            self._news_topic,
+            event.model_dump(mode="json"),
+            message_id=message_id,
+            correlation_id=event.correlation_id,
+        )
+        self._log.info(
+            "ingestion.news_published",
+            topic=self._news_topic,
+            symbols=event.symbols,
+            source=event.source,
+            message_id=message_id,
+        )
+        return message_id

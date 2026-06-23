@@ -287,7 +287,19 @@ class AIAnalysisService:
         max_messages: int = 10,
     ) -> None:
         while True:
-            processed = await self.poll_once(max_messages=max_messages)
+            try:
+                processed = await self.poll_once(max_messages=max_messages)
+            except Exception as exc:
+                self.metrics.last_error = (
+                    f"ai polling failed: {type(exc).__name__}: {exc}"
+                )
+                self._log.warning(
+                    "ai.poll_failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             if processed == 0:
                 await asyncio.sleep(poll_interval_seconds)
 

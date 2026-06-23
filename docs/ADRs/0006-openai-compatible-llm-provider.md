@@ -22,15 +22,16 @@ configurable base URL reaches all of them.
 Collapse the live LLM/embedding path to **one** OpenAI-compatible provider, `OpenAIProvider`,
 configured by a single set of variables:
 
-- `OPENAI_API_KEY` — credential (required to go live)
+- `OPENAI_API_KEY` — credential for hosted providers; may be empty for local
+  OpenAI-compatible servers such as LM Studio
 - `OPENAI_BASE_URL` — target any OpenAI-compatible endpoint (defaults to OpenAI)
 - `OPENAI_CHAT_MODEL`, `OPENAI_EMBEDDING_MODEL` — model ids
 
 `MockLLMProvider` remains the offline default. Selection is now purely:
 
 - `MOCK_LLM=1` (default) → deterministic mock, fully offline.
-- `MOCK_LLM=0` + `OPENAI_API_KEY` → OpenAI-compatible client.
-- `MOCK_LLM=0` without a key → a clear configuration error.
+- `MOCK_LLM=0` → OpenAI-compatible client. Hosted providers still need
+  `OPENAI_API_KEY`; local providers may not.
 
 The dedicated `AzureOpenAIProvider` and `AnthropicProvider` classes, their settings, the
 `LLM_PROVIDER` / `EMBEDDING_PROVIDER` selectors, and their tests are removed. Azure OpenAI

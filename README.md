@@ -20,6 +20,7 @@ task test
 Smoke helpers:
 
 ```bash
+task seed:market
 task smoke:sb
 task smoke:ws
 ```
@@ -92,6 +93,7 @@ task format        # Black + ruff format pass
 task up            # Build and start infra + app services
 task down          # Stop containers and remove volumes
 task ps            # Show compose status
+task seed:market   # Publish sample market.raw events for local API testing
 task smoke:sb      # Peek Service Bus topic messages
 task smoke:ws      # Subscribe to the API websocket smoke stream
 task clean         # Remove .venv and cache directories

@@ -198,6 +198,10 @@ class DruidClient:
         self._base_url = url.rstrip("/")
 
     @staticmethod
+    def _sql_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    @staticmethod
     def _build_ingest_specs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
             return []
@@ -224,6 +228,7 @@ class DruidClient:
                         },
                         "ioConfig": {
                             "type": "index_parallel",
+                            "appendToExisting": True,
                             "inputSource": {
                                 "type": "inline",
                                 "data": "\n".join(json.dumps(r) for r in table_rows),
@@ -282,8 +287,9 @@ class DruidClient:
 
     async def latest(self, symbol: str) -> dict[str, Any] | None:
         sql = (
-            f"SELECT * FROM ticks WHERE symbol = '{symbol}' "
-            "ORDER BY ts DESC LIMIT 1"
+            'SELECT * FROM "ticks" '
+            f'WHERE "symbol" = {self._sql_literal(symbol)} '
+            'ORDER BY "__time" DESC LIMIT 1'
         )
         rows = await self.query_sql(sql)
         return rows[0] if rows else None
@@ -295,9 +301,11 @@ class DruidClient:
         to: datetime,
     ) -> list[dict[str, Any]]:
         sql = (
-            f"SELECT * FROM ticks WHERE symbol = '{symbol}' "
-            f"AND ts >= '{frm.isoformat()}' AND ts <= '{to.isoformat()}' "
-            "ORDER BY ts ASC"
+            'SELECT * FROM "ticks" '
+            f'WHERE "symbol" = {self._sql_literal(symbol)} '
+            f'AND "__time" >= {self._sql_literal(frm.isoformat())} '
+            f'AND "__time" <= {self._sql_literal(to.isoformat())} '
+            'ORDER BY "__time" ASC'
         )
         return await self.query_sql(sql)
 

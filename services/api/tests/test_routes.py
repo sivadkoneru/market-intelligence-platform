@@ -74,6 +74,11 @@ class SymbolQueryRecordingStore(InMemoryTimeSeriesStore):
         return await super().query_sql(sql)
 
 
+class LatestFailingStore(InMemoryTimeSeriesStore):
+    async def latest(self, symbol: str) -> dict[str, Any] | None:
+        raise AssertionError("latest should use cached snapshot before Druid")
+
+
 def _seed_store(store: InMemoryTimeSeriesStore) -> None:
     base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     rows = [
@@ -394,6 +399,104 @@ def test_symbols_include_cached_snapshots_when_druid_datasources_are_absent() ->
     assert response.json() == {"symbols": ["ADAUSDT", "BTCUSDT"], "count": 2}
     assert len(store.queries) == 1
     assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
+
+
+def test_latest_market_uses_cached_snapshot_before_druid() -> None:
+    import asyncio
+
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = LatestFailingStore()
+    asyncio.run(cache.set_snapshot(
+        "BTCUSDT",
+        {
+            "symbol": "BTCUSDT",
+            "ts": "2026-01-01T00:00:00Z",
+            "source": "seed.local",
+            "event_type": "trade",
+            "price": 42000.0,
+            "volume": 1.0,
+            "bid": 41999.75,
+            "ask": 42000.25,
+        },
+    ))
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get("/market/BTCUSDT/latest")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "symbol": "BTCUSDT",
+        "ts": "2026-01-01T00:00:00Z",
+        "source": "seed.local",
+        "event_type": "trade",
+        "price": 42000.0,
+        "volume": 1.0,
+        "bid": 41999.75,
+        "ask": 42000.25,
+    }
+
+
+def test_market_history_includes_recent_cached_rows_when_druid_is_empty() -> None:
+    import asyncio
+
+    bus = InMemoryBus()
+    cache = InMemoryCache()
+    store = InMemoryTimeSeriesStore()
+
+    async def seed() -> None:
+        await cache.set(
+            "history:BTCUSDT",
+            [
+                {
+                    "event_id": "too-early",
+                    "ts": "2025-12-31T23:59:59Z",
+                    "symbol": "BTCUSDT",
+                    "price": 99999.0,
+                },
+                {
+                    "event_id": "btc-2",
+                    "ts": "2026-01-01T00:00:02Z",
+                    "symbol": "BTCUSDT",
+                    "source": "seed.local",
+                    "event_type": "trade",
+                    "price": 100200.0,
+                    "volume": 0.2,
+                },
+                {
+                    "event_id": "btc-1",
+                    "ts": "2026-01-01T00:00:01Z",
+                    "symbol": "BTCUSDT",
+                    "source": "seed.local",
+                    "event_type": "trade",
+                    "price": 100100.0,
+                    "volume": 0.1,
+                },
+                {
+                    "event_id": "eth-1",
+                    "ts": "2026-01-01T00:00:01Z",
+                    "symbol": "ETHUSDT",
+                    "price": 3500.0,
+                },
+            ],
+        )
+
+    asyncio.run(seed())
+
+    with TestClient(create_app(APIService(store=store, cache=cache, bus=bus))) as client:
+        response = client.get(
+            "/market/BTCUSDT/history",
+            params={
+                "from": "2026-01-01T00:00:00Z",
+                "to": "2026-01-01T00:00:03Z",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["symbol"] == "BTCUSDT"
+    assert [row["event_id"] for row in payload["rows"]] == ["btc-1", "btc-2"]
+    assert [row["price"] for row in payload["rows"]] == [100100.0, 100200.0]
 
 
 def test_indicators_fall_back_to_timeseries_when_cache_is_empty() -> None:
