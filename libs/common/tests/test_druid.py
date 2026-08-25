@@ -557,3 +557,33 @@ async def test_druid_client_rebuilds_after_close(counting_httpx):
     await client.query_sql("SELECT 2")
 
     assert len(counting_httpx.instances) == 2
+
+
+@pytest.mark.asyncio
+async def test_history_with_a_zero_limit_returns_no_rows_from_either_backend():
+    """
+    ``rows[-0:]`` is the whole list, so the fake answered a zero limit with every
+    row while Druid's ``LIMIT 0`` answered with none. A fake that disagrees with
+    its client is worse than no fake.
+    """
+    store = InMemoryTimeSeriesStore()
+    await store.ingest(
+        [
+            {"symbol": "BTC", "ts": f"2024-01-01T00:00:{i:02d}+00:00", "event_id": f"t{i}"}
+            for i in range(3)
+        ]
+    )
+    client = _RecordingDruidClient(rows=[{"event_id": "unexpected"}])
+
+    assert await store.history("BTC", _ts(2024, 1, 1), _ts(2024, 1, 2), limit=0) == []
+    assert await client.history("BTC", _ts(2024, 1, 1), _ts(2024, 1, 2), limit=0) == []
+    assert client.sql is None, "a zero limit must not cost a round trip"
+
+
+@pytest.mark.asyncio
+async def test_history_with_a_negative_limit_issues_no_query():
+    """``LIMIT -1`` is a Druid SQL error, not an empty result."""
+    client = _RecordingDruidClient(rows=[{"event_id": "unexpected"}])
+
+    assert await client.history("BTC", _ts(2024, 1, 1), _ts(2024, 1, 2), limit=-5) == []
+    assert client.sql is None

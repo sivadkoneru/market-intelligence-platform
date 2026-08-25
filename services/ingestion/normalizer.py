@@ -68,20 +68,29 @@ def normalize_market_payload(
         # the 24h price *change* (often negative) and `q` the quote volume, with
         # the last price in `c` and the base volume in `v`. Picking by presence
         # rather than by stream published price changes as prices.
+        #
+        # `b`/`a` are reused the same way, and more dangerously: on `24hrTicker`
+        # they are the best bid/ask *prices*, but on a `trade` frame they are the
+        # buyer and seller *order IDs* — monotonic integers around 1e11. Reading
+        # them on a trade frame stored order IDs as quotes.
+        bid: float | None = None
+        ask: float | None = None
         if is_trade:
             price = float(payload["p"])
             volume = _optional_float(payload.get("q"))
         else:
             price = float(payload["c"])
             volume = _optional_float(payload.get("v"))
+            bid = _optional_float(payload.get("b"))
+            ask = _optional_float(payload.get("a"))
         return MarketEvent(
             symbol=symbol,
             source=source_override or "binance",
             event_type="trade" if is_trade else "ticker",
             price=price,
             volume=volume,
-            bid=_optional_float(payload.get("b")),
-            ask=_optional_float(payload.get("a")),
+            bid=bid,
+            ask=ask,
             ts=_coerce_datetime(float(event_ts) / 1000.0),
         )
 

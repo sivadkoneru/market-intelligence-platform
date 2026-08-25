@@ -506,3 +506,33 @@ def test_is_stale_when_every_signal_is_old() -> None:
     state.mark_message(start)
 
     assert state.is_stale(stale_after_seconds=30, now=start + timedelta(seconds=31)) is True
+
+
+@pytest.mark.asyncio
+async def test_socket_recycle_is_not_recorded_as_a_connection_failure() -> None:
+    """
+    A close that already streamed messages is routine exchange churn. Counting
+    it as a transport failure inflated connect_failures and pinned last_error to
+    a benign close message for the rest of the client's life.
+    """
+    bus = InMemoryBus()
+    await bus.receive(TOPIC_MARKET_RAW, "stream", max_messages=1)
+    trade = {"e": "trade", "s": "BTCUSDT", "p": "42100.5", "q": "0.25", "T": 1704067200000}
+    connect_factory = SequenceConnectFactory(
+        [
+            FakeWebSocket([trade]),
+            FakeWebSocket([{**trade, "T": 1704067201000}]),
+        ]
+    )
+    client = BinanceWebSocketClient(
+        bus=bus,
+        connect_factory=connect_factory,
+        reconnect_backoff_seconds=0,
+    )
+
+    state = await client.run(max_messages=2)
+
+    assert state.events_published == 2
+    assert state.reconnects == 1, "the socket was recycled exactly once"
+    assert state.connect_failures == 0, "a productive close is not a connect failure"
+    assert state.last_error is None, "a productive close must not poison last_error"

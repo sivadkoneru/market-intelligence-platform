@@ -186,6 +186,39 @@ async def test_peek_respects_n():
     assert len(msgs) == 5
 
 
+@pytest.mark.asyncio
+async def test_peek_numbers_messages_monotonically_per_subscription():
+    bus = InMemoryBus()
+    await bus.receive("t", "s1", max_messages=0)
+    await bus.receive("t", "s2", max_messages=0)
+    for i in range(3):
+        await bus.publish("t", {"i": i}, message_id=f"seq-{i}")
+
+    first = await bus.peek("t", "s1", n=10)
+    second = await bus.peek("t", "s2", n=10)
+
+    sequences = [msg.sequence_number for msg in first]
+    assert sequences == sorted(sequences)
+    assert None not in sequences
+    assert sequences == [msg.sequence_number for msg in second]
+
+
+@pytest.mark.asyncio
+async def test_peek_resumes_from_a_sequence_number():
+    """A reader that remembers where it stopped must not re-read the backlog."""
+    bus = InMemoryBus()
+    await bus.receive("t", "s", max_messages=0)
+    for i in range(5):
+        await bus.publish("t", {"i": i}, message_id=f"resume-{i}")
+
+    head = await bus.peek("t", "s", n=2)
+    assert head[-1].sequence_number is not None
+    rest = await bus.peek("t", "s", n=10, from_sequence_number=head[-1].sequence_number + 1)
+
+    assert [msg.body["i"] for msg in head] == [0, 1]
+    assert [msg.body["i"] for msg in rest] == [2, 3, 4]
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -238,6 +271,7 @@ class _FakeReceiver:
     def __init__(self, received: list | None = None) -> None:
         self.completed: list = []
         self.dead_lettered: list = []
+        self.peek_calls: list[dict] = []
         self.received = received or []
 
     async def __aenter__(self):
@@ -256,7 +290,14 @@ class _FakeReceiver:
         return list(self.received)
 
     async def peek_messages(self, **kwargs):
-        return list(self.received)[: kwargs.get("max_message_count", len(self.received))]
+        self.peek_calls.append(dict(kwargs))
+        messages = list(self.received)
+        start = kwargs.get("sequence_number")
+        if start is not None:
+            messages = [
+                msg for msg in messages if (getattr(msg, "sequence_number", None) or 0) >= start
+            ]
+        return messages[: kwargs.get("max_message_count", len(messages))]
 
 
 class _FakeRawMessage:
@@ -267,10 +308,12 @@ class _FakeRawMessage:
         mid: str = "msg-1",
         body: object = b'{"v": 1}',
         correlation_id: str | None = "corr-1",
+        sequence_number: int | None = None,
     ) -> None:
         self.message_id = mid
         self.body = body
         self.correlation_id = correlation_id
+        self.sequence_number = sequence_number
 
 
 class _FakeServiceBusClient:
@@ -295,6 +338,7 @@ def _make_servicebus_bus_with_fake_receiver(
     bus = object.__new__(ServiceBusBus)
     bus._senders = {}
     bus._receivers = {}
+    bus._receiver_locks = {}
     # Inject the fake receiver
     fake_receiver = _FakeReceiver()
     bus._receivers[(topic, subscription, None)] = fake_receiver
@@ -356,6 +400,7 @@ async def test_servicebus_receive_decodes_sectioned_body():
     bus = object.__new__(ServiceBusBus)
     bus._senders = {}
     bus._receivers = {}
+    bus._receiver_locks = {}
     bus._client = fake_client
 
     messages = await bus.receive("topic", "sub")
@@ -368,17 +413,94 @@ async def test_servicebus_receive_decodes_sectioned_body():
 
 @pytest.mark.asyncio
 async def test_servicebus_peek_decodes_sectioned_body():
-    raw = _FakeRawMessage("id-peek", body=[b'{"peek"', b": true}"])
+    raw = _FakeRawMessage("id-peek", body=[b'{"peek"', b": true}"], sequence_number=7)
     fake_rx = _FakeReceiver(received=[raw])
     fake_client = _FakeServiceBusClient(fake_rx)
     bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._receiver_locks = {}
     bus._client = fake_client
 
     messages = await bus.peek("topic", "sub")
 
     assert len(messages) == 1
     assert messages[0].body == {"peek": True}
+    assert messages[0].sequence_number == 7
     assert fake_client.receiver_calls == [{"topic_name": "topic", "subscription_name": "sub"}]
+
+
+@pytest.mark.asyncio
+async def test_servicebus_peek_reuses_the_cached_receiver():
+    """A fresh AMQP link per peek was pure setup cost on the API's hottest read."""
+    fake_rx = _FakeReceiver(received=[_FakeRawMessage("id-peek", sequence_number=1)])
+    fake_client = _FakeServiceBusClient(fake_rx)
+    bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._receiver_locks = {}
+    bus._client = fake_client
+
+    await bus.peek("topic", "sub")
+    await bus.peek("topic", "sub")
+
+    assert len(fake_client.receiver_calls) == 1, "the second peek built a second receiver"
+    assert len(fake_rx.peek_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_servicebus_peek_serialises_concurrent_calls_on_one_receiver():
+    """
+    A ServiceBusReceiver is not safe for concurrent use, and two API requests
+    peek at once as a matter of routine — sharing the cached link is only safe
+    while one peek holds it.
+    """
+    import asyncio
+
+    class _OverlapDetectingReceiver(_FakeReceiver):
+        def __init__(self) -> None:
+            super().__init__(received=[_FakeRawMessage("id-1", sequence_number=1)])
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def peek_messages(self, **kwargs):
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            await asyncio.sleep(0)  # yield, so an unguarded peek would overlap
+            self.in_flight -= 1
+            return await super().peek_messages(**kwargs)
+
+    fake_rx = _OverlapDetectingReceiver()
+    bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._receiver_locks = {}
+    bus._client = _FakeServiceBusClient(fake_rx)
+
+    await asyncio.gather(*(bus.peek("topic", "sub") for _ in range(4)))
+
+    assert fake_rx.max_in_flight == 1, "concurrent peeks shared one receiver"
+
+
+@pytest.mark.asyncio
+async def test_servicebus_peek_forwards_the_resume_sequence_number():
+    fake_rx = _FakeReceiver(
+        received=[
+            _FakeRawMessage("id-1", sequence_number=1),
+            _FakeRawMessage("id-2", sequence_number=2),
+        ]
+    )
+    fake_client = _FakeServiceBusClient(fake_rx)
+    bus = object.__new__(ServiceBusBus)
+    bus._senders = {}
+    bus._receivers = {}
+    bus._receiver_locks = {}
+    bus._client = fake_client
+
+    messages = await bus.peek("topic", "sub", n=5, from_sequence_number=2)
+
+    assert [msg.message_id for msg in messages] == ["id-2"]
+    assert fake_rx.peek_calls[0]["sequence_number"] == 2
 
 
 @pytest.mark.asyncio
@@ -389,6 +511,7 @@ async def test_servicebus_receive_dead_letter_keeps_receiver_for_settlement():
     bus = object.__new__(ServiceBusBus)
     bus._senders = {}
     bus._receivers = {}
+    bus._receiver_locks = {}
     bus._client = fake_client
 
     messages = await bus.receive_dead_letter("topic", "sub")
@@ -463,6 +586,7 @@ def _bus_with_fake_client() -> tuple[ServiceBusBus, _FakeSenderOnlyClient]:
     bus._client = cast(Any, client)
     bus._senders = {}
     bus._receivers = {}
+    bus._receiver_locks = {}
     return bus, client
 
 

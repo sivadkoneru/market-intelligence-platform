@@ -59,14 +59,17 @@ class NewsPollingService:
             self.metrics.collectors_polled += 1
             try:
                 events = await collector.poll_once()
-            except Exception as exc:  # pragma: no cover - defensive logging path
+            except Exception as exc:
+                # A collector's failure is isolated to itself — the remaining
+                # collectors are independent and should still be polled this
+                # cycle rather than the whole run aborting on the first error.
                 self.metrics.last_error = str(exc)
                 self._log.warning(
                     "ingestion.news_collector_error",
                     collector=getattr(collector, "name", collector.__class__.__name__),
                     error=str(exc),
                 )
-                raise
+                continue
 
             for event in events:
                 self.metrics.events_seen += 1

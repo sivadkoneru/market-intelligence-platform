@@ -217,6 +217,12 @@ class _EmptyOpenAIClient(_FakeOpenAIClient):
         return {"choices": [{"message": {"content": ""}}]}
 
 
+class _NoChoicesOpenAIClient(_FakeOpenAIClient):
+    async def _chat_create(self, **kwargs: object) -> object:
+        self.chat_calls.append(dict(kwargs))
+        return {"choices": []}
+
+
 @pytest.mark.asyncio
 async def test_openai_provider_parses_fake_chat_and_embeddings() -> None:
     fake_client = _FakeOpenAIClient()
@@ -302,6 +308,25 @@ async def test_openai_provider_fallback_summarizes_empty_chat_from_context() -> 
     assert "Bitcoin miners reported stronger margins" in result.summary
     assert "https://example.test/btc-1" in result.explanation
     assert result.grounded is True
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_fallback_handles_no_choices_in_response() -> None:
+    fake_client = _NoChoicesOpenAIClient()
+    provider = OpenAIProvider(
+        api_key="key",
+        base_url="https://api.openai.com/v1",
+        chat_model="gpt-test",
+        embedding_model="embed-test",
+        client=fake_client,
+    )
+
+    result = await provider.generate(_request())
+
+    assert result.provider == "openai"
+    assert result.model == "gpt-test"
+    assert isinstance(result.summary, str)
+    assert result.raw_text == ""
 
 
 def test_guardrails_accept_grounded_output_and_reject_ungrounded_output() -> None:

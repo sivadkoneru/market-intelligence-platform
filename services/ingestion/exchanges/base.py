@@ -156,7 +156,7 @@ class ExchangeWebSocketClient:
                 )
                 published += outcome.published
                 if outcome.productive_close is not None:
-                    self._record_reconnect(outcome.productive_close, reconnects_used)
+                    self._record_productive_close(outcome.productive_close)
                     reconnects_used = 0
                     self.state.reconnects += 1
                     await self._sleep(self._backoff_delay(1))
@@ -331,6 +331,23 @@ class ExchangeWebSocketClient:
             source=self.source,
             reconnects_used=reconnects_used,
             error=str(exc),
+        )
+
+    def _record_productive_close(self, exc: ExchangeStreamClosed) -> None:
+        """
+        Account for a socket recycle that had already streamed messages.
+
+        Routine exchange churn, not a transport failure — so it is logged at
+        info and leaves ``connect_failures`` and ``last_error`` alone. Routing
+        it through ``_record_reconnect`` pinned ``last_error`` to a benign close
+        message for the rest of the client's life and inflated the failure
+        counter that ``/health`` reports.
+        """
+        self._log.info(
+            "ingestion.exchange_socket_recycled",
+            source=self.source,
+            published=exc.published,
+            reconnects=self.state.reconnects,
         )
 
     def is_stale(

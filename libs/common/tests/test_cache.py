@@ -12,6 +12,7 @@ from libs.common.redis_client import (
     decode_cache_value,
     encode_cache_value,
     get_cache,
+    history_key,
     seen_key,
     snapshot_key,
 )
@@ -140,6 +141,38 @@ async def test_list_snapshot_symbols_ignores_expired_snapshots():
 
 
 # ---------------------------------------------------------------------------
+# History mirror — append_history / get_history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_history_returns_empty_list_when_absent():
+    cache = InMemoryCache()
+    assert await cache.get_history("BTCUSDT") == []
+
+
+@pytest.mark.asyncio
+async def test_append_history_accumulates_rows_under_the_shared_key():
+    cache = InMemoryCache()
+    await cache.append_history("BTCUSDT", {"ts": "2024-01-01T00:00:00Z", "close": 1.0})
+    await cache.append_history("BTCUSDT", {"ts": "2024-01-01T00:01:00Z", "close": 2.0})
+
+    rows = await cache.get_history("BTCUSDT")
+    assert [row["close"] for row in rows] == [1.0, 2.0]
+    assert await cache.get(history_key("BTCUSDT")) == rows
+
+
+@pytest.mark.asyncio
+async def test_append_history_caps_at_max_rows():
+    cache = InMemoryCache()
+    for i in range(5):
+        await cache.append_history("BTCUSDT", {"close": float(i)}, max_rows=3)
+
+    rows = await cache.get_history("BTCUSDT")
+    assert [row["close"] for row in rows] == [2.0, 3.0, 4.0]
+
+
+# ---------------------------------------------------------------------------
 # seen() — idempotency
 # ---------------------------------------------------------------------------
 
@@ -203,15 +236,14 @@ def test_encode_cache_value_emits_json_bytes():
     assert json.loads(encoded) == {"price": 1.5}
 
 
-def test_decode_cache_value_rejects_pickle_payloads():
-    """A pickle blob must raise, never be executed — see CWE-502."""
-    with pytest.raises(ValueError, match="not valid JSON"):
-        decode_cache_value("snapshot:BTCUSDT", pickle.dumps({"price": 1.5}))
+def test_decode_cache_value_ignores_pickle_payloads():
+    """A pickle blob must never be executed (CWE-502) — it reads as a miss."""
+    assert decode_cache_value("snapshot:BTCUSDT", pickle.dumps({"price": 1.5})) is None
 
 
-def test_decode_cache_value_error_names_the_key():
-    with pytest.raises(ValueError, match="snapshot:BTCUSDT"):
-        decode_cache_value("snapshot:BTCUSDT", b"{not json")
+def test_decode_cache_value_ignores_invalid_json_and_bytes():
+    assert decode_cache_value("snapshot:BTCUSDT", b"{not json") is None
+    assert decode_cache_value("snapshot:BTCUSDT", b"\xff\xfe not utf-8") is None
 
 
 # ---------------------------------------------------------------------------
@@ -330,12 +362,19 @@ async def test_redis_cache_list_snapshot_symbols_is_sorted(redis_cache):
 
 
 @pytest.mark.asyncio
-async def test_redis_cache_surfaces_corrupt_payloads(redis_cache):
+async def test_redis_cache_treats_legacy_payloads_as_a_miss(redis_cache):
+    """
+    Snapshot keys carry no TTL, so a value left by the pre-JSON build survives
+    every restart. Raising made ``/market/{symbol}/latest`` answer 500 forever;
+    a miss lets the caller fall back to the store and the next write replace it.
+    """
     cache, fake = redis_cache
     fake.store["snapshot:BTCUSDT"] = pickle.dumps({"price": 1.0})
 
-    with pytest.raises(ValueError, match="not valid JSON"):
-        await cache.get_snapshot("BTCUSDT")
+    assert await cache.get_snapshot("BTCUSDT") is None
+
+    await cache.set_snapshot("BTCUSDT", {"price": 2.0})
+    assert await cache.get_snapshot("BTCUSDT") == {"price": 2.0}
 
 
 # ---------------------------------------------------------------------------

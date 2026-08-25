@@ -44,7 +44,6 @@ from services.stream.indicators import (
 HISTORY_WINDOW_MULTIPLIER = 8
 STREAM_SUBSCRIPTION = "stream"
 IDEMPOTENCY_PREFIX = "stream:processed"
-HISTORY_PREFIX = "history"
 MAX_CACHED_HISTORY_ROWS = 500
 
 
@@ -326,9 +325,8 @@ class StreamService:
 
         try:
             processed = self._processor.process(event)
-            await self._store.ingest([processed.tick_row])
+            await self._store.ingest([processed.tick_row, processed.indicator_row])
             self.metrics.tick_rows_ingested += 1
-            await self._store.ingest([processed.indicator_row])
             self.metrics.indicator_rows_ingested += 1
 
             await self._cache.set_snapshot(event.symbol, processed.snapshot)
@@ -368,13 +366,9 @@ class StreamService:
         )
 
     async def _append_cached_history(self, symbol: str, row: dict[str, Any]) -> None:
-        key = f"{HISTORY_PREFIX}:{symbol}"
-        history = await self._cache.get(key)
-        rows = list(history) if isinstance(history, list) else []
         cached_row = dict(row)
         cached_row.pop("_table", None)
-        rows.append(cached_row)
-        await self._cache.set(key, rows[-MAX_CACHED_HISTORY_ROWS:])
+        await self._cache.append_history(symbol, cached_row, max_rows=MAX_CACHED_HISTORY_ROWS)
 
 
 def _trend_score(trend: str | None) -> float | None:

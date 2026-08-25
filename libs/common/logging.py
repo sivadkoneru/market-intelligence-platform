@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import os
 import sys
@@ -347,10 +348,27 @@ def configure_logging(
 
     Safe to call multiple times (idempotent). The *level* parameter overrides
     the standard library root logger level; defaults to "INFO".
+
+    The sink (service name, log index, search store) is process-wide global
+    state, not scoped per caller — the only supported deployment shape is one
+    service per process. Calling this again with a different *service_name*
+    silently reassigns every subsequent log line and search-store write to the
+    new service. A debug-level diagnostic is logged when that happens so it's
+    discoverable, at a severity below every service's default log level (some
+    scripts — e.g. ``scripts/bench.py`` — legitimately trigger this by
+    importing more than one service package, each of whose ``app.py`` bootstraps
+    its own logging as an import side effect, before applying their own final
+    configuration; that is expected and must not surface as visible output).
     """
     global _configured, _log_index, _search_store, _service_name  # noqa: PLW0603
 
     resolved_service_name = service_name or "market-intel"
+    if _configured and _service_name != resolved_service_name:
+        logging.getLogger(__name__).debug(
+            "logging.reconfigured_for_different_service: %s -> %s",
+            _service_name,
+            resolved_service_name,
+        )
     _service_name = resolved_service_name
     if log_index:
         _log_index = log_index
@@ -408,6 +426,32 @@ def configure_logging(
     root_logger.setLevel(numeric_level)
 
     _configured = True
+
+
+async def close_log_sink() -> None:
+    """
+    Release the search store backing the log sink, if it owns a connection.
+
+    ``bootstrap_service_logging`` builds this store separately from the ones a
+    service passes to ``close_backends``, so nothing else reaches it: without
+    this, every restart of a crash-looping service leaked its HTTP client.
+    Failures are swallowed — a shutdown path must not raise — and the global is
+    cleared either way, so the call is idempotent.
+    """
+    global _search_store  # noqa: PLW0603
+
+    store = _search_store
+    _search_store = None
+    close = getattr(store, "close", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        # Logging here would write through the very sink being torn down.
+        return
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

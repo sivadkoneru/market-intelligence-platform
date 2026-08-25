@@ -31,6 +31,7 @@ from libs.common.logging import (
     bind_context,
     bind_correlation_id,
     bind_trace_id,
+    close_log_sink,
     configure_logging,
     configure_new_relic,
     create_observability_middleware,
@@ -96,6 +97,7 @@ __all__ = [
     "Settings",
     "get_settings",
     # Logging
+    "close_log_sink",
     "configure_logging",
     "configure_new_relic",
     "get_logger",

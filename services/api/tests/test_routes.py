@@ -49,7 +49,13 @@ class NoPrimeBus:
     async def dead_letter(self, msg, reason: str = "") -> None:
         return None
 
-    async def peek(self, topic: str, subscription: str, n: int = 10):
+    async def peek(
+        self,
+        topic: str,
+        subscription: str,
+        n: int = 10,
+        from_sequence_number: int | None = None,
+    ):
         return []
 
     async def receive_dead_letter(self, topic: str, subscription: str):
@@ -354,8 +360,10 @@ def test_symbols_query_uses_only_known_druid_datasources() -> None:
     assert response.json() == {"symbols": ["BTCUSDT", "ETHUSDT"], "count": 2}
     assert len(store.queries) == 3
     assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
-    assert 'FROM "ticks"' in store.queries[1]
-    assert 'FROM "indicators"' in store.queries[2]
+    # The per-table symbol queries run concurrently, so their relative order
+    # in store.queries is not guaranteed.
+    assert any('FROM "ticks"' in query for query in store.queries[1:])
+    assert any('FROM "indicators"' in query for query in store.queries[1:])
 
 
 def test_symbols_skips_missing_indicator_datasource() -> None:
@@ -379,7 +387,7 @@ def test_symbols_skips_missing_indicator_datasource() -> None:
     assert response.status_code == 200
     assert response.json() == {"symbols": ["BTCUSDT", "SOLUSDT"], "count": 2}
     assert len(store.queries) == 2
-    assert 'FROM "ticks"' in store.queries[1]
+    assert any('FROM "ticks"' in query for query in store.queries[1:])
     assert all('FROM "indicators"' not in query for query in store.queries[1:])
 
 
@@ -1030,11 +1038,15 @@ class CountingAPIService(APIService):
         return super()._validated_payload(message, model)
 
 
-def test_insight_stops_validating_once_the_symbol_matches() -> None:
-    """Eagerly validating the whole window cost a full Pydantic pass per request."""
+def test_insight_validates_each_message_once_across_requests() -> None:
+    """
+    Re-reading the peek window cost a full Pydantic pass over the backlog on
+    every request. The read model validates each message once and remembers it,
+    so a second request for the same symbol validates nothing new.
+    """
     import asyncio
 
-    async def scenario() -> tuple[dict[str, Any] | None, int]:
+    async def scenario() -> tuple[dict[str, Any] | None, int, int]:
         bus = InMemoryBus()
         await bus.receive(TOPIC_INSIGHTS, API_SUBSCRIPTION, max_messages=0)
         service = CountingAPIService(
@@ -1059,13 +1071,17 @@ def test_insight_stops_validating_once_the_symbol_matches() -> None:
                 message_id=f"ins-{seq}",
             )
 
-        return await service.insight("BTCUSDT"), service.validated_count
+        payload = await service.insight("BTCUSDT")
+        after_first = service.validated_count
+        await service.insight("BTCUSDT")
+        return payload, after_first, service.validated_count
 
-    payload, validated = asyncio.run(scenario())
+    payload, after_first, after_second = asyncio.run(scenario())
 
     assert payload is not None
     assert payload["event_id"] == "ins-49", "should return the most recent insight"
-    assert validated == 1, "the newest message matched, so nothing else needed validating"
+    assert after_first == 50, "the backlog is validated once, on the way into the read model"
+    assert after_second == after_first, "the second request re-validated the backlog"
 
 
 # ---------------------------------------------------------------------------
@@ -1222,3 +1238,91 @@ def test_indicators_fallback_queries_only_the_matching_symbol() -> None:
     assert payload is not None
     assert payload["indicators"]["rsi"] == 99.0, "must return the latest row, not the first"
     assert store.sql_queries == [], "no unfiltered table scan should be issued"
+
+
+class _PeekRecordingBus(InMemoryBus):
+    """InMemoryBus that records the arguments of every peek."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.peek_calls: list[tuple[str, int, int | None]] = []
+
+    async def peek(self, topic, subscription, n=10, from_sequence_number=None):
+        self.peek_calls.append((topic, n, from_sequence_number))
+        return await super().peek(topic, subscription, n, from_sequence_number)
+
+
+def test_signals_reads_only_the_delta_on_a_second_request() -> None:
+    """
+    Re-peeking the whole window per request re-read and re-decoded the entire
+    backlog. The cursor makes each request pay only for what has since arrived.
+    """
+    import asyncio
+
+    async def scenario() -> tuple[list[dict[str, Any]], list[tuple[str, int, int | None]]]:
+        bus = _PeekRecordingBus()
+        await bus.receive(TOPIC_SIGNALS, API_SUBSCRIPTION, max_messages=0)
+        service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=bus)
+        for seq in range(30):
+            await bus.publish(TOPIC_SIGNALS, _signal_body(seq), message_id=f"sig-{seq}")
+
+        await service.signals(limit=5)
+        bus.peek_calls.clear()
+        await bus.publish(TOPIC_SIGNALS, _signal_body(30), message_id="sig-30")
+        payloads = await service.signals(limit=5)
+        return payloads, list(bus.peek_calls)
+
+    payloads, peek_calls = asyncio.run(scenario())
+
+    assert payloads[0]["event_id"] == "sig-0030", "the newest signal must be served first"
+    resumed = [call for call in peek_calls if call[2] is not None]
+    assert resumed, "the second request restarted from the head of the subscription"
+    assert all(call[2] == 31 for call in resumed), "the cursor did not advance past the backlog"
+
+
+def test_signals_serve_newest_first_on_a_bus_without_sequence_numbers() -> None:
+    """The sequence number is optional on the port, so the fallback must work."""
+    import asyncio
+
+    class _UnnumberedBus(InMemoryBus):
+        async def peek(self, topic, subscription, n=10, from_sequence_number=None):
+            messages = await super().peek(topic, subscription, n, from_sequence_number)
+            for message in messages:
+                message.sequence_number = None
+            return messages
+
+    async def scenario() -> list[dict[str, Any]]:
+        bus = _UnnumberedBus()
+        await bus.receive(TOPIC_SIGNALS, API_SUBSCRIPTION, max_messages=0)
+        service = APIService(store=InMemoryTimeSeriesStore(), cache=InMemoryCache(), bus=bus)
+        for seq in range(10):
+            await bus.publish(TOPIC_SIGNALS, _signal_body(seq), message_id=f"sig-{seq}")
+        await service.signals(limit=2)
+        return await service.signals(limit=2)
+
+    payloads = asyncio.run(scenario())
+
+    assert [p["event_id"] for p in payloads] == ["sig-0009", "sig-0008"]
+
+
+def test_market_history_with_a_zero_limit_returns_no_rows() -> None:
+    """``ordered[-0:]`` handed back every merged row instead of none."""
+    import asyncio
+
+    async def scenario() -> list[dict[str, Any]]:
+        store = InMemoryTimeSeriesStore()
+        await store.ingest(
+            [
+                {"symbol": "BTCUSDT", "ts": f"2026-01-01T00:00:{i:02d}+00:00", "price": 1.0 + i}
+                for i in range(5)
+            ]
+        )
+        service = APIService(store=store, cache=InMemoryCache(), bus=InMemoryBus())
+        return await service.market_history(
+            "BTCUSDT",
+            frm=datetime(2026, 1, 1, tzinfo=UTC),
+            to=datetime(2026, 1, 2, tzinfo=UTC),
+            limit=0,
+        )
+
+    assert asyncio.run(scenario()) == []

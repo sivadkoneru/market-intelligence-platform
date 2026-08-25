@@ -163,6 +163,34 @@ def test_configure_logging_clears_previous_search_store(capsys):
     assert store.logs("logs-market-intel") == []
 
 
+def test_configure_logging_logs_debug_diagnostic_when_reconfigured_for_a_different_service(
+    capsys,
+):
+    """
+    The diagnostic is DEBUG-level, not WARNING: some legitimate callers (e.g.
+    ``scripts/bench.py``, which imports more than one service package before
+    applying its own final logging config) trigger this every run, and must
+    not see it in their output at their normal (INFO/WARNING) log level.
+    """
+    from libs.common.logging import configure_logging
+
+    # DEBUG so this test can observe the diagnostic at all.
+    configure_logging(level="DEBUG", service_name="first")
+    capsys.readouterr()  # discard output from the state left by earlier tests
+
+    configure_logging(level="DEBUG", service_name="first")
+    assert "reconfigured_for_different_service" not in capsys.readouterr().out
+
+    configure_logging(level="DEBUG", service_name="second")
+    assert "reconfigured_for_different_service" in capsys.readouterr().out
+
+    # At a normal service log level, the diagnostic is filtered out.
+    configure_logging(level="INFO", service_name="third")
+    capsys.readouterr()
+    configure_logging(level="INFO", service_name="fourth")
+    assert "reconfigured_for_different_service" not in capsys.readouterr().out
+
+
 def test_configure_logging_swallow_search_store_failures(capsys):
     from libs.common.logging import configure_logging, get_logger, reset_context
 
@@ -392,3 +420,53 @@ def test_unknown_http_methods_collapse_to_one_metric_label():
         )
 
     assert metrics.requests_by_method == {"GET": 1, OTHER_METHOD: 2}
+
+
+class _ClosableSearchStore:
+    """Search store stand-in that records whether it was released."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    async def index_log(self, index: str, payload: dict) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+def test_close_log_sink_releases_the_store_and_is_idempotent():
+    """
+    bootstrap_service_logging builds this store outside the set a service hands
+    to close_backends, so nothing else reaches it: every restart leaked it.
+    """
+    from libs.common.logging import close_log_sink, configure_logging
+
+    store = _ClosableSearchStore()
+    configure_logging(level="INFO", search_store=cast(SearchStore, store))
+
+    asyncio.run(close_log_sink())
+    assert store.closed == 1
+
+    asyncio.run(close_log_sink())
+    assert store.closed == 1, "the sink was closed twice"
+
+
+def test_close_log_sink_without_a_configured_store_is_a_no_op():
+    from libs.common.logging import close_log_sink, configure_logging
+
+    configure_logging(level="INFO")
+
+    asyncio.run(close_log_sink())  # must not raise
+
+
+def test_close_log_sink_swallows_a_failing_store():
+    from libs.common.logging import close_log_sink, configure_logging
+
+    class _FailingStore(_ClosableSearchStore):
+        async def close(self) -> None:
+            raise RuntimeError("elasticsearch is gone")
+
+    configure_logging(level="INFO", search_store=cast(SearchStore, _FailingStore()))
+
+    asyncio.run(close_log_sink())  # a shutdown path must not raise

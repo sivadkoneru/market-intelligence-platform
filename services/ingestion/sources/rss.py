@@ -33,6 +33,12 @@ MAX_ENTRIES_PER_FEED = 500
 _DOCTYPE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
 _ROOT_ELEMENT_START = re.compile(r"<[A-Za-z_]")
 _PROLOG_SCAN_LIMIT = 64 * 1024
+# Processing instructions (``<?...?>``) and comments (``<!--...-->``) are the
+# only things XML allows before the root element besides the DOCTYPE itself.
+# Both can contain a ``<letter`` sequence (e.g. inside a comment's text), which
+# would otherwise fool ``_ROOT_ELEMENT_START`` into treating the comment's
+# interior as the root element and truncating the DOCTYPE scan before it.
+_LEADING_MISC = re.compile(r"\A\s*(?:<\?.*?\?>|<!--.*?-->)", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -82,26 +88,47 @@ def _first_text(*values: str | None) -> str | None:
     return None
 
 
+def _strip_leading_misc(head: str) -> str:
+    """Strip leading processing instructions and comments from *head*."""
+    while True:
+        match = _LEADING_MISC.match(head)
+        if not match:
+            return head
+        head = head[match.end() :]
+
+
 def _reject_doctype(xml_payload: str | bytes) -> None:
     """
     Raise if the document declares a DTD.
 
     Only the prolog — everything before the root element's start tag — is
     scanned, so a feed whose article text happens to mention ``<!DOCTYPE`` is
-    still accepted.
+    still accepted. Leading processing instructions and comments are skipped
+    before looking for the root element, so a ``<letter`` sequence inside a
+    comment cannot be mistaken for the root element start and truncate the
+    scan before a DOCTYPE that follows the comment.
     """
     head = xml_payload[:_PROLOG_SCAN_LIMIT]
     if isinstance(head, bytes):
         head = head.decode("utf-8", "replace")
 
-    root_start = _ROOT_ELEMENT_START.search(head)
-    prolog = head[: root_start.start()] if root_start else head
+    stripped = _strip_leading_misc(head)
+    consumed = len(head) - len(stripped)
+    root_start = _ROOT_ELEMENT_START.search(stripped)
+    prolog = head[: consumed + root_start.start()] if root_start else head
     if _DOCTYPE.search(prolog):
         raise ValueError("feed declares a DOCTYPE; refusing to parse untrusted DTD")
 
 
+def _payload_bytes(xml_payload: str | bytes) -> int:
+    """Size of *xml_payload* in bytes — ``len()`` of a ``str`` counts characters."""
+    if isinstance(xml_payload, str):
+        return len(xml_payload.encode("utf-8"))
+    return len(xml_payload)
+
+
 def _parse_feed_entries(xml_payload: str | bytes) -> list[ET.Element]:
-    if len(xml_payload) > MAX_FEED_BYTES:
+    if _payload_bytes(xml_payload) > MAX_FEED_BYTES:
         raise ValueError(f"feed payload exceeds {MAX_FEED_BYTES} bytes")
     _reject_doctype(xml_payload)
 
@@ -158,16 +185,26 @@ def _normalize_rss_entry(
     )
 
 
+FEED_CHUNK_BYTES = 64 * 1024
+
+
 async def _fetch_rss_text(url: str) -> str:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as response:
         response.raise_for_status()
         # Read with a hard cap rather than response.text(): a hostile or
         # broken feed must not be able to stream unbounded bytes into memory.
-        raw = await response.content.read(MAX_FEED_BYTES + 1)
-        if len(raw) > MAX_FEED_BYTES:
-            raise ValueError(f"feed at {url} exceeds {MAX_FEED_BYTES} bytes")
-        return raw.decode(response.charset or "utf-8", "replace")
+        #
+        # Chunked rather than a single ``content.read(n)``: that call returns
+        # whatever is already buffered, so any feed arriving in more than one
+        # chunk was silently truncated mid-document and then failed to parse.
+        # The cap is re-checked per chunk, so at most one chunk overshoots it.
+        buffer = bytearray()
+        async for chunk in response.content.iter_chunked(FEED_CHUNK_BYTES):
+            buffer.extend(chunk)
+            if len(buffer) > MAX_FEED_BYTES:
+                raise ValueError(f"feed at {url} exceeds {MAX_FEED_BYTES} bytes")
+        return bytes(buffer).decode(response.charset or "utf-8", "replace")
 
 
 class RssCollector:

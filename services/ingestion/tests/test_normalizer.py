@@ -105,3 +105,43 @@ def test_normalize_binance_trade_uses_trade_price_and_quantity() -> None:
     assert event.event_type == "trade"
     assert event.price == 42100.5
     assert event.volume == 0.25
+
+
+def test_binance_trade_frame_does_not_publish_order_ids_as_quotes() -> None:
+    """
+    On a trade frame `b`/`a` are the buyer/seller order IDs, not the best
+    bid/ask — reading them stored ~1e11 "prices" in Druid and served them out
+    of the API.
+    """
+    event = normalize_market_payload(
+        {
+            "e": "trade",
+            "s": "BTCUSDT",
+            "p": "42100.5",
+            "q": "0.25",
+            "b": 88_192_413_776,
+            "a": 88_192_413_780,
+            "T": 1704067200000,
+        }
+    )
+
+    assert event.price == 42100.5
+    assert event.bid is None
+    assert event.ask is None
+
+
+def test_binance_ticker_frame_still_maps_best_bid_and_ask() -> None:
+    event = normalize_market_payload(
+        {
+            "e": "24hrTicker",
+            "s": "BTCUSDT",
+            "c": "42100.5",
+            "v": "1200.0",
+            "b": "42100.0",
+            "a": "42101.0",
+            "E": 1704067200000,
+        }
+    )
+
+    assert event.bid == 42100.0
+    assert event.ask == 42101.0
