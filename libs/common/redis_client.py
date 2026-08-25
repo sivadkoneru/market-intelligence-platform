@@ -29,8 +29,10 @@ __all__ = [
     "decode_cache_value",
     "snapshot_key",
     "seen_key",
+    "history_key",
     "IDEMPOTENCY_TTL_SECONDS",
     "SNAPSHOT_PREFIX",
+    "HISTORY_PREFIX",
 ]
 
 # How long a "already handled this event" marker is retained. It has to outlast
@@ -45,6 +47,7 @@ IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 # apart without any test noticing.
 SNAPSHOT_PREFIX = "snapshot"
 SEEN_PREFIX = "seen"
+HISTORY_PREFIX = "history"
 
 
 def snapshot_key(symbol: str) -> str:
@@ -55,6 +58,11 @@ def snapshot_key(symbol: str) -> str:
 def seen_key(key: str) -> str:
     """Return the cache key holding the idempotency marker for *key*."""
     return f"{SEEN_PREFIX}:{key}"
+
+
+def history_key(symbol: str) -> str:
+    """Return the cache key holding the recent-history mirror for *symbol*."""
+    return f"{HISTORY_PREFIX}:{symbol}"
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +141,16 @@ class Cache(Protocol):
 
     async def seen(self, key: str) -> bool:
         """Idempotency check: returns False the first time, True every subsequent time."""
+        ...
+
+    async def append_history(
+        self, symbol: str, row: dict[str, Any], *, max_rows: int = 500
+    ) -> None:
+        """Append *row* to the recent-history mirror for *symbol*, capped at *max_rows*."""
+        ...
+
+    async def get_history(self, symbol: str) -> list[dict[str, Any]]:
+        """Return the cached recent-history rows for *symbol* (empty if none cached)."""
         ...
 
 
@@ -221,6 +239,19 @@ class InMemoryCache:
         self._seen_keys.add(key)
         return False
 
+    async def append_history(
+        self, symbol: str, row: dict[str, Any], *, max_rows: int = 500
+    ) -> None:
+        key = history_key(symbol)
+        history = await self.get(key)
+        rows = list(history) if isinstance(history, list) else []
+        rows.append(dict(row))
+        await self.set(key, rows[-max_rows:])
+
+    async def get_history(self, symbol: str) -> list[dict[str, Any]]:
+        history = await self.get(history_key(symbol))
+        return list(history) if isinstance(history, list) else []
+
 
 # ---------------------------------------------------------------------------
 # RedisCache (real client — import-guarded)
@@ -296,6 +327,19 @@ class RedisCache:
             nx=True,
         )
         return not created
+
+    async def append_history(
+        self, symbol: str, row: dict[str, Any], *, max_rows: int = 500
+    ) -> None:
+        key = history_key(symbol)
+        history = await self.get(key)
+        rows = list(history) if isinstance(history, list) else []
+        rows.append(dict(row))
+        await self.set(key, rows[-max_rows:])
+
+    async def get_history(self, symbol: str) -> list[dict[str, Any]]:
+        history = await self.get(history_key(symbol))
+        return list(history) if isinstance(history, list) else []
 
     async def close(self) -> None:
         await self._client.aclose()

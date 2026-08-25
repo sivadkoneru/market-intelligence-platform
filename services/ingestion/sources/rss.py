@@ -33,6 +33,12 @@ MAX_ENTRIES_PER_FEED = 500
 _DOCTYPE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
 _ROOT_ELEMENT_START = re.compile(r"<[A-Za-z_]")
 _PROLOG_SCAN_LIMIT = 64 * 1024
+# Processing instructions (``<?...?>``) and comments (``<!--...-->``) are the
+# only things XML allows before the root element besides the DOCTYPE itself.
+# Both can contain a ``<letter`` sequence (e.g. inside a comment's text), which
+# would otherwise fool ``_ROOT_ELEMENT_START`` into treating the comment's
+# interior as the root element and truncating the DOCTYPE scan before it.
+_LEADING_MISC = re.compile(r"\A\s*(?:<\?.*?\?>|<!--.*?-->)", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -82,20 +88,34 @@ def _first_text(*values: str | None) -> str | None:
     return None
 
 
+def _strip_leading_misc(head: str) -> str:
+    """Strip leading processing instructions and comments from *head*."""
+    while True:
+        match = _LEADING_MISC.match(head)
+        if not match:
+            return head
+        head = head[match.end() :]
+
+
 def _reject_doctype(xml_payload: str | bytes) -> None:
     """
     Raise if the document declares a DTD.
 
     Only the prolog — everything before the root element's start tag — is
     scanned, so a feed whose article text happens to mention ``<!DOCTYPE`` is
-    still accepted.
+    still accepted. Leading processing instructions and comments are skipped
+    before looking for the root element, so a ``<letter`` sequence inside a
+    comment cannot be mistaken for the root element start and truncate the
+    scan before a DOCTYPE that follows the comment.
     """
     head = xml_payload[:_PROLOG_SCAN_LIMIT]
     if isinstance(head, bytes):
         head = head.decode("utf-8", "replace")
 
-    root_start = _ROOT_ELEMENT_START.search(head)
-    prolog = head[: root_start.start()] if root_start else head
+    stripped = _strip_leading_misc(head)
+    consumed = len(head) - len(stripped)
+    root_start = _ROOT_ELEMENT_START.search(stripped)
+    prolog = head[: consumed + root_start.start()] if root_start else head
     if _DOCTYPE.search(prolog):
         raise ValueError("feed declares a DOCTYPE; refusing to parse untrusted DTD")
 

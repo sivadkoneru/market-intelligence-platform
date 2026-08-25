@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 
@@ -147,13 +148,17 @@ class RAGPipeline:
             self.embedding_dimensions,
         )
         embeddings = await self._embed_texts(tuple(chunk.text for chunk in chunks))
-        for chunk, vector in zip(chunks, embeddings.vectors, strict=True):
-            await self.search_store.index_document(
-                self.index_name,
-                chunk.chunk_id,
-                chunk.to_search_document(),
-                vector=list(vector),
+        await asyncio.gather(
+            *(
+                self.search_store.index_document(
+                    self.index_name,
+                    chunk.chunk_id,
+                    chunk.to_search_document(),
+                    vector=list(vector),
+                )
+                for chunk, vector in zip(chunks, embeddings.vectors, strict=True)
             )
+        )
         return chunks
 
     async def retrieve_chunks(

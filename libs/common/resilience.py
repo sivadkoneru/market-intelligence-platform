@@ -71,6 +71,7 @@ class CircuitBreaker:
         self._state: CircuitState = CircuitState.CLOSED
         self._failure_count: int = 0
         self._opened_at: float | None = None
+        self._half_open_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,6 +97,30 @@ class CircuitBreaker:
                 f"(threshold={self.failure_threshold}, timeout={self.reset_timeout}s)"
             )
 
+        if self._state == CircuitState.HALF_OPEN:
+            # Only one probe call is allowed through at a time — an extra
+            # caller that arrives while a probe is already in flight fails
+            # fast instead of silently piling onto a backend that hasn't
+            # been confirmed recovered yet.
+            if self._half_open_lock.locked():
+                raise CircuitOpenError(
+                    "Circuit is HALF_OPEN and a probe is already in flight; failing fast."
+                )
+            async with self._half_open_lock:
+                return await self._do_call(coro_fn, *args, **kwargs)
+
+        return await self._do_call(coro_fn, *args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _do_call(
+        self,
+        coro_fn: Callable[..., Coroutine[Any, Any, T]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> T:
         try:
             result = await coro_fn(*args, **kwargs)
         except Exception:
@@ -104,10 +129,6 @@ class CircuitBreaker:
         else:
             self._record_success()
             return result
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _maybe_transition_half_open(self) -> None:
         if (

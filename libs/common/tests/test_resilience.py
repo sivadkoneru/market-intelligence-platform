@@ -1,5 +1,6 @@
 """Tests for libs.common.resilience — retry, circuit breaker, and consumer helpers."""
 
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -217,6 +218,53 @@ async def test_circuit_success_resets_failure_count():
     await cb.call(ok)
     assert cb.state == CircuitState.CLOSED
     assert cb._failure_count == 0
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_half_open_rejects_concurrent_probe():
+    """Only one probe call is allowed through HALF_OPEN at a time."""
+    now = [0.0]
+
+    def clock():
+        return now[0]
+
+    cb = CircuitBreaker(failure_threshold=1, reset_timeout=30.0, time_fn=clock)
+
+    async def boom():
+        raise RuntimeError("fail")
+
+    with pytest.raises(RuntimeError):
+        await cb.call(boom)
+
+    now[0] = 31.0  # → HALF_OPEN
+    assert cb.state == CircuitState.HALF_OPEN
+
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    calls = []
+
+    async def slow_probe():
+        calls.append(1)
+        probe_started.set()
+        await release_probe.wait()
+        return "ok"
+
+    async def second_caller():
+        await probe_started.wait()
+        with pytest.raises(CircuitOpenError):
+            await cb.call(slow_probe)
+
+    first_task = asyncio.create_task(cb.call(slow_probe))
+    second_task = asyncio.create_task(second_caller())
+
+    await probe_started.wait()
+    await second_task
+    release_probe.set()
+    result = await first_task
+
+    assert result == "ok"
+    assert len(calls) == 1
+    assert cb.state == CircuitState.CLOSED
 
 
 # ---------------------------------------------------------------------------

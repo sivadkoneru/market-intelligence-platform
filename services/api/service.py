@@ -31,7 +31,6 @@ from libs.common import (
 
 API_SUBSCRIPTION = "api"
 API_WS_SUBSCRIPTION = "api-ws"
-HISTORY_PREFIX = "history"
 # Fallback window for a bus that cannot supply sequence numbers. peek() returns
 # from the head of the subscription, so responses take the TAIL of this window.
 BUS_PEEK_WINDOW = 1_000
@@ -365,19 +364,20 @@ class APIService:
             """
         )
         known_tables = {str(row["TABLE_NAME"]) for row in table_rows if row.get("TABLE_NAME")}
-        rows: list[dict[str, Any]] = []
-        for table in candidate_tables:
-            if table not in known_tables:
-                continue
-            rows.extend(
-                await self._store.query_sql(
+        results = await asyncio.gather(
+            *(
+                self._store.query_sql(
                     f"""
                     SELECT DISTINCT "symbol" AS "symbol"
                     FROM "{table}"
                     WHERE "symbol" IS NOT NULL
                     """
                 )
+                for table in candidate_tables
+                if table in known_tables
             )
+        )
+        rows: list[dict[str, Any]] = [row for symbol_rows in results for row in symbol_rows]
         symbols = {str(row["symbol"]) for row in rows if row.get("symbol")}
         symbols.update(await self._cache.list_snapshot_symbols())
         return sorted(symbols)
@@ -590,9 +590,7 @@ class APIService:
         frm: datetime,
         to: datetime,
     ) -> list[dict[str, Any]]:
-        history = await self._cache.get(f"{HISTORY_PREFIX}:{symbol}")
-        if not isinstance(history, list):
-            return []
+        history = await self._cache.get_history(symbol)
 
         rows: list[dict[str, Any]] = []
         for row in history:

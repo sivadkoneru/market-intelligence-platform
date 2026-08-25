@@ -163,6 +163,34 @@ def test_configure_logging_clears_previous_search_store(capsys):
     assert store.logs("logs-market-intel") == []
 
 
+def test_configure_logging_logs_debug_diagnostic_when_reconfigured_for_a_different_service(
+    capsys,
+):
+    """
+    The diagnostic is DEBUG-level, not WARNING: some legitimate callers (e.g.
+    ``scripts/bench.py``, which imports more than one service package before
+    applying its own final logging config) trigger this every run, and must
+    not see it in their output at their normal (INFO/WARNING) log level.
+    """
+    from libs.common.logging import configure_logging
+
+    # DEBUG so this test can observe the diagnostic at all.
+    configure_logging(level="DEBUG", service_name="first")
+    capsys.readouterr()  # discard output from the state left by earlier tests
+
+    configure_logging(level="DEBUG", service_name="first")
+    assert "reconfigured_for_different_service" not in capsys.readouterr().out
+
+    configure_logging(level="DEBUG", service_name="second")
+    assert "reconfigured_for_different_service" in capsys.readouterr().out
+
+    # At a normal service log level, the diagnostic is filtered out.
+    configure_logging(level="INFO", service_name="third")
+    capsys.readouterr()
+    configure_logging(level="INFO", service_name="fourth")
+    assert "reconfigured_for_different_service" not in capsys.readouterr().out
+
+
 def test_configure_logging_swallow_search_store_failures(capsys):
     from libs.common.logging import configure_logging, get_logger, reset_context
 

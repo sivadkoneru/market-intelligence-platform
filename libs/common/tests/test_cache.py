@@ -12,6 +12,7 @@ from libs.common.redis_client import (
     decode_cache_value,
     encode_cache_value,
     get_cache,
+    history_key,
     seen_key,
     snapshot_key,
 )
@@ -137,6 +138,38 @@ async def test_list_snapshot_symbols_ignores_expired_snapshots():
     now[0] = 10.1
 
     assert await cache.list_snapshot_symbols() == ["ETHUSDT"]
+
+
+# ---------------------------------------------------------------------------
+# History mirror — append_history / get_history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_history_returns_empty_list_when_absent():
+    cache = InMemoryCache()
+    assert await cache.get_history("BTCUSDT") == []
+
+
+@pytest.mark.asyncio
+async def test_append_history_accumulates_rows_under_the_shared_key():
+    cache = InMemoryCache()
+    await cache.append_history("BTCUSDT", {"ts": "2024-01-01T00:00:00Z", "close": 1.0})
+    await cache.append_history("BTCUSDT", {"ts": "2024-01-01T00:01:00Z", "close": 2.0})
+
+    rows = await cache.get_history("BTCUSDT")
+    assert [row["close"] for row in rows] == [1.0, 2.0]
+    assert await cache.get(history_key("BTCUSDT")) == rows
+
+
+@pytest.mark.asyncio
+async def test_append_history_caps_at_max_rows():
+    cache = InMemoryCache()
+    for i in range(5):
+        await cache.append_history("BTCUSDT", {"close": float(i)}, max_rows=3)
+
+    rows = await cache.get_history("BTCUSDT")
+    assert [row["close"] for row in rows] == [2.0, 3.0, 4.0]
 
 
 # ---------------------------------------------------------------------------

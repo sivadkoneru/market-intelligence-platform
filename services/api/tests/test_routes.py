@@ -360,8 +360,10 @@ def test_symbols_query_uses_only_known_druid_datasources() -> None:
     assert response.json() == {"symbols": ["BTCUSDT", "ETHUSDT"], "count": 2}
     assert len(store.queries) == 3
     assert "FROM INFORMATION_SCHEMA.TABLES" in store.queries[0]
-    assert 'FROM "ticks"' in store.queries[1]
-    assert 'FROM "indicators"' in store.queries[2]
+    # The per-table symbol queries run concurrently, so their relative order
+    # in store.queries is not guaranteed.
+    assert any('FROM "ticks"' in query for query in store.queries[1:])
+    assert any('FROM "indicators"' in query for query in store.queries[1:])
 
 
 def test_symbols_skips_missing_indicator_datasource() -> None:
@@ -385,7 +387,7 @@ def test_symbols_skips_missing_indicator_datasource() -> None:
     assert response.status_code == 200
     assert response.json() == {"symbols": ["BTCUSDT", "SOLUSDT"], "count": 2}
     assert len(store.queries) == 2
-    assert 'FROM "ticks"' in store.queries[1]
+    assert any('FROM "ticks"' in query for query in store.queries[1:])
     assert all('FROM "indicators"' not in query for query in store.queries[1:])
 
 

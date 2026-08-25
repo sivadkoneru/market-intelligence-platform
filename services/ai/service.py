@@ -4,7 +4,6 @@ Core AI-analysis worker for news and signal insight generation.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
+from tenacity import RetryError
 
 from libs.common import (
     IDEMPOTENCY_TTL_SECONDS,
@@ -31,6 +31,7 @@ from libs.common import (
     dead_letter_message,
     get_logger,
     render_counters,
+    retry_async,
     run_poll_loop,
     validation_reason,
 )
@@ -228,7 +229,8 @@ class AIAnalysisService:
         insight_topic: str = TOPIC_INSIGHTS,
         subscription: str = AI_SUBSCRIPTION,
         max_processing_attempts: int = 3,
-        retry_backoff_seconds: float = 0.0,
+        retry_wait_min_seconds: float = 0.0,
+        retry_wait_max_seconds: float = 0.0,
     ) -> None:
         self._bus = bus
         self._cache = cache
@@ -241,7 +243,8 @@ class AIAnalysisService:
         self._insight_topic = insight_topic
         self._subscription = subscription
         self._max_processing_attempts = max(1, max_processing_attempts)
-        self._retry_backoff_seconds = retry_backoff_seconds
+        self._retry_wait_min_seconds = retry_wait_min_seconds
+        self._retry_wait_max_seconds = retry_wait_max_seconds
         self.metrics = AIMetrics()
         self._log = get_logger(__name__)
 
@@ -337,18 +340,26 @@ class AIAnalysisService:
         message: ReceivedMessage,
         operation: Callable[[], Awaitable[None]],
     ) -> None:
-        for attempt in range(1, self._max_processing_attempts + 1):
-            try:
-                await operation()
-                return
-            except Exception as exc:
-                self.metrics.last_error = f"ai analysis failed: {type(exc).__name__}: {exc}"
-                if attempt >= self._max_processing_attempts:
-                    await self._dead_letter(message, self.metrics.last_error)
-                    return
+        attempts = 0
+
+        async def _attempt() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
                 self.metrics.processing_retries += 1
-                if self._retry_backoff_seconds > 0:
-                    await asyncio.sleep(self._retry_backoff_seconds)
+            await operation()
+
+        try:
+            await retry_async(
+                _attempt,
+                max_attempts=self._max_processing_attempts,
+                wait_min=self._retry_wait_min_seconds,
+                wait_max=self._retry_wait_max_seconds,
+            )
+        except RetryError as exc:
+            last_exc = exc.last_attempt.exception()
+            self.metrics.last_error = f"ai analysis failed: {type(last_exc).__name__}: {last_exc}"
+            await self._dead_letter(message, self.metrics.last_error)
 
     async def _process_news_event(
         self,
@@ -418,8 +429,10 @@ class AIAnalysisService:
 
         detection = await self._event_detector.detect_news(event, symbol=symbol)
         prompt = _news_prompt(event, symbol=symbol, detection=detection)
-        result = await self._generate_with_cache(
+        await self._publish_insight_for(
+            symbol=symbol,
             content_hash=content_hash,
+            processed_key=processed_key,
             prompt=prompt,
             query=f"{symbol} {event.title} {event.body}",
             metadata={
@@ -428,20 +441,11 @@ class AIAnalysisService:
                 "event_framework": detection.framework,
                 "source_event_id": event.event_id,
             },
-        )
-        insight = _insight_from_result(
-            symbol=symbol,
             event_ts=event.ts,
             correlation_id=event.correlation_id,
             trace_id=event.trace_id,
-            result=_with_event_detection(result, detection),
+            detection=detection,
         )
-        await self._publish_insight(insight, message_id=processed_key)
-        await self._cache.set(
-            f"{INSIGHT_CACHE_PREFIX}:{symbol}",
-            insight.model_dump(mode="json"),
-        )
-        await self._cache.set(processed_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)
 
     async def _publish_signal_insight(self, signal: Signal) -> None:
         content_hash = signal_content_hash(signal)
@@ -452,8 +456,10 @@ class AIAnalysisService:
 
         detection = await self._event_detector.detect_signal(signal)
         prompt = _signal_prompt(signal, detection=detection)
-        result = await self._generate_with_cache(
+        await self._publish_insight_for(
+            symbol=signal.symbol,
             content_hash=content_hash,
+            processed_key=processed_key,
             prompt=prompt,
             query=_signal_query(signal),
             metadata={
@@ -462,17 +468,48 @@ class AIAnalysisService:
                 "event_framework": detection.framework,
                 "source_event_id": signal.event_id,
             },
-        )
-        insight = _insight_from_result(
-            symbol=signal.symbol,
             event_ts=signal.ts,
             correlation_id=signal.correlation_id,
             trace_id=signal.trace_id,
+            detection=detection,
+        )
+
+    async def _publish_insight_for(
+        self,
+        *,
+        symbol: str,
+        content_hash: str,
+        processed_key: str,
+        prompt: str,
+        query: str,
+        metadata: dict[str, Any],
+        event_ts: Any,
+        correlation_id: str | None,
+        trace_id: str | None,
+        detection: EventDetectionResult,
+    ) -> None:
+        """
+        Shared tail for ``_publish_news_insight``/``_publish_signal_insight``:
+        generate (with cache) → build the insight → publish → cache it →
+        mark the source event processed. Callers own the kind-specific
+        dedupe check, detection call, and prompt/query construction.
+        """
+        result = await self._generate_with_cache(
+            content_hash=content_hash,
+            prompt=prompt,
+            query=query,
+            metadata=metadata,
+        )
+        insight = _insight_from_result(
+            symbol=symbol,
+            event_ts=event_ts,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
             result=_with_event_detection(result, detection),
         )
         await self._publish_insight(insight, message_id=processed_key)
         await self._cache.set(
-            f"{INSIGHT_CACHE_PREFIX}:{signal.symbol}",
+            f"{INSIGHT_CACHE_PREFIX}:{symbol}",
             insight.model_dump(mode="json"),
         )
         await self._cache.set(processed_key, True, ttl=IDEMPOTENCY_TTL_SECONDS)

@@ -179,6 +179,39 @@ async def test_news_service_publishes_to_news_raw_with_stable_ids() -> None:
     assert second_metrics.events_seen == 2
 
 
+class _FailingCollector:
+    name = "failing-collector"
+
+    async def poll_once(self):
+        raise RuntimeError("collector unavailable")
+
+
+@pytest.mark.asyncio
+async def test_run_once_continues_polling_remaining_collectors_after_one_fails() -> None:
+    bus = InMemoryBus()
+    await bus.receive(TOPIC_NEWS_RAW, "analysis", max_messages=1)
+
+    async def rss_fetcher(_: str) -> str:
+        return RSS_XML
+
+    healthy_collector = RssCollector(
+        [RssFeed(url="https://example.com/feed.xml", source="example-rss")],
+        fetcher=rss_fetcher,
+    )
+    service = NewsPollingService(
+        bus=bus,
+        collectors=[_FailingCollector(), healthy_collector],
+    )
+
+    metrics = await service.run_once()
+    messages = await bus.peek(TOPIC_NEWS_RAW, "analysis", n=10)
+
+    assert metrics.collectors_polled == 2
+    assert metrics.last_error == "collector unavailable"
+    assert len(messages) == 1
+    assert messages[0].body["source"] == "example-rss"
+
+
 @pytest.mark.asyncio
 async def test_news_hash_suppresses_duplicates_without_source_timestamp() -> None:
     bus = InMemoryBus()
@@ -301,6 +334,27 @@ async def test_rss_collector_accepts_a_feed_mentioning_doctype_in_its_body() -> 
 
     events = await collector.poll_once()
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_refuses_a_dtd_hidden_behind_a_leading_comment() -> None:
+    """A ``<letter`` sequence inside a leading comment must not hide a DOCTYPE."""
+    feed = (
+        '<?xml version="1.0"?><!--x<a-->'
+        '<!DOCTYPE rss [<!ENTITY a "AAAAAAAAAA">]>'
+        '<rss version="2.0"><channel><item><title>&a;</title></item></channel></rss>'
+    )
+
+    async def bomb_fetcher(_: str) -> str:
+        return feed
+
+    collector = RssCollector(
+        [RssFeed(url="https://example.com/bomb.xml", source="example-rss")],
+        fetcher=bomb_fetcher,
+    )
+
+    with pytest.raises(ValueError, match="DOCTYPE"):
+        await collector.poll_once()
 
 
 @pytest.mark.asyncio

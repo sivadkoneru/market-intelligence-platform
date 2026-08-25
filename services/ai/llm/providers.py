@@ -427,10 +427,14 @@ class OpenAIProvider(LLMProvider, EmbeddingProvider):
             temperature=request.temperature,
             max_tokens=request.max_tokens,
         )
-        choice = _get_attr(response, "choices", [])[0]
-        message = _get_attr(choice, "message", {})
-        raw_text = _extract_text(_get_attr(message, "content", ""))
+        raw_text = ""
         try:
+            choices = _get_attr(response, "choices", [])
+            if not choices:
+                raise ValueError("provider response contained no choices")
+            choice = choices[0]
+            message = _get_attr(choice, "message", {})
+            raw_text = _extract_text(_get_attr(message, "content", ""))
             payload = _parse_json_result(raw_text)
             result = _structured_from_payload(
                 provider="openai",

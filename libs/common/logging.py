@@ -348,10 +348,27 @@ def configure_logging(
 
     Safe to call multiple times (idempotent). The *level* parameter overrides
     the standard library root logger level; defaults to "INFO".
+
+    The sink (service name, log index, search store) is process-wide global
+    state, not scoped per caller — the only supported deployment shape is one
+    service per process. Calling this again with a different *service_name*
+    silently reassigns every subsequent log line and search-store write to the
+    new service. A debug-level diagnostic is logged when that happens so it's
+    discoverable, at a severity below every service's default log level (some
+    scripts — e.g. ``scripts/bench.py`` — legitimately trigger this by
+    importing more than one service package, each of whose ``app.py`` bootstraps
+    its own logging as an import side effect, before applying their own final
+    configuration; that is expected and must not surface as visible output).
     """
     global _configured, _log_index, _search_store, _service_name  # noqa: PLW0603
 
     resolved_service_name = service_name or "market-intel"
+    if _configured and _service_name != resolved_service_name:
+        logging.getLogger(__name__).debug(
+            "logging.reconfigured_for_different_service: %s -> %s",
+            _service_name,
+            resolved_service_name,
+        )
     _service_name = resolved_service_name
     if log_index:
         _log_index = log_index

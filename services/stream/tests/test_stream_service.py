@@ -35,9 +35,14 @@ class RecordingStore(InMemoryTimeSeriesStore):
 
 class FailingIndicatorStore(InMemoryTimeSeriesStore):
     async def ingest(self, rows: list[dict[str, Any]]) -> None:
-        if rows[0].get("_table") == "indicators":
+        # Mirrors the real DruidClient: rows are grouped and POSTed per table
+        # sequentially, so the tick row can land before the indicator POST
+        # fails — even when both rows arrive in a single ingest() call.
+        ok_rows = [row for row in rows if row.get("_table") != "indicators"]
+        if ok_rows:
+            await super().ingest(ok_rows)
+        if any(row.get("_table") == "indicators" for row in rows):
             raise RuntimeError("indicator ingest failed")
-        await super().ingest(rows)
 
 
 class FlakyReceiveBus(InMemoryBus):
@@ -112,10 +117,10 @@ async def test_service_ingests_druid_rows_caches_snapshot_and_publishes_signal()
     assert processed == 6
     assert await store.count("ticks") == 6
     assert await store.count("indicators") == 6
-    assert len(recording_store.ingest_calls) == 12
-    assert all(len(call) == 1 for call in recording_store.ingest_calls)
+    assert len(recording_store.ingest_calls) == 6
+    assert all(len(call) == 2 for call in recording_store.ingest_calls)
     assert recording_store.ingest_calls[0][0]["_table"] == "ticks"
-    assert recording_store.ingest_calls[1][0]["_table"] == "indicators"
+    assert recording_store.ingest_calls[0][1]["_table"] == "indicators"
 
     tick_rows = await store.query_sql('SELECT * FROM "ticks"')
     indicator_rows = await store.query_sql('SELECT * FROM "indicators"')
