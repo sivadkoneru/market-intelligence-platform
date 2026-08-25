@@ -203,15 +203,14 @@ def test_encode_cache_value_emits_json_bytes():
     assert json.loads(encoded) == {"price": 1.5}
 
 
-def test_decode_cache_value_rejects_pickle_payloads():
-    """A pickle blob must raise, never be executed — see CWE-502."""
-    with pytest.raises(ValueError, match="not valid JSON"):
-        decode_cache_value("snapshot:BTCUSDT", pickle.dumps({"price": 1.5}))
+def test_decode_cache_value_ignores_pickle_payloads():
+    """A pickle blob must never be executed (CWE-502) — it reads as a miss."""
+    assert decode_cache_value("snapshot:BTCUSDT", pickle.dumps({"price": 1.5})) is None
 
 
-def test_decode_cache_value_error_names_the_key():
-    with pytest.raises(ValueError, match="snapshot:BTCUSDT"):
-        decode_cache_value("snapshot:BTCUSDT", b"{not json")
+def test_decode_cache_value_ignores_invalid_json_and_bytes():
+    assert decode_cache_value("snapshot:BTCUSDT", b"{not json") is None
+    assert decode_cache_value("snapshot:BTCUSDT", b"\xff\xfe not utf-8") is None
 
 
 # ---------------------------------------------------------------------------
@@ -330,12 +329,19 @@ async def test_redis_cache_list_snapshot_symbols_is_sorted(redis_cache):
 
 
 @pytest.mark.asyncio
-async def test_redis_cache_surfaces_corrupt_payloads(redis_cache):
+async def test_redis_cache_treats_legacy_payloads_as_a_miss(redis_cache):
+    """
+    Snapshot keys carry no TTL, so a value left by the pre-JSON build survives
+    every restart. Raising made ``/market/{symbol}/latest`` answer 500 forever;
+    a miss lets the caller fall back to the store and the next write replace it.
+    """
     cache, fake = redis_cache
     fake.store["snapshot:BTCUSDT"] = pickle.dumps({"price": 1.0})
 
-    with pytest.raises(ValueError, match="not valid JSON"):
-        await cache.get_snapshot("BTCUSDT")
+    assert await cache.get_snapshot("BTCUSDT") is None
+
+    await cache.set_snapshot("BTCUSDT", {"price": 2.0})
+    assert await cache.get_snapshot("BTCUSDT") == {"price": 2.0}
 
 
 # ---------------------------------------------------------------------------

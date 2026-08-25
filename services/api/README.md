@@ -64,5 +64,9 @@ await service.prime_subscriptions()
   rows from the time-series store.
 - Insights are served from the cached `insight:{symbol}` payload first, then from the
   message bus peek path as a fallback.
+- `/signals`, `/alerts`, and the insight fallback share one incremental read model:
+  each request resumes its peek at the sequence number the last one stopped at, so it
+  pays only for messages that arrived since. The newest `RECENT_WINDOW` payloads per
+  topic are retained.
 - WebSocket clients send `{"action":"subscribe","symbols":["BTCUSDT"]}` and then
   receive live `market`, `signal`, `alert`, and `insight` messages for matching symbols.

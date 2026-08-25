@@ -360,7 +360,16 @@ for msg in dlq:
     await bus.publish(msg.topic, msg.body, message_id=f"{msg.message_id}:replay")
     await bus.complete(msg)          # settle original DLQ message after replay
 peeked = await bus.peek("market.raw", "stream-sub", n=5)
+
+# Peek reads from the head of the subscription. To read only what has arrived
+# since the last peek, resume from the sequence number it stopped at.
+cursor = peeked[-1].sequence_number + 1
+newer = await bus.peek("market.raw", "stream-sub", n=5, from_sequence_number=cursor)
 ```
+
+**Sequence numbers:** `ReceivedMessage.sequence_number` is broker-assigned and
+monotonic within a subscription. It is optional — an implementation that cannot
+supply one leaves it `None`, and readers fall back to peeking a fixed window.
 
 **Duplicate detection:** Publishing with the same `message_id` twice is idempotent — the
 second publish is silently dropped in both `InMemoryBus` and `ServiceBusBus`.
@@ -391,8 +400,10 @@ if await cache.set_if_absent("lock:event-id-xyz", True, ttl=300):
 `encode_cache_value` / `decode_cache_value`. Redis holds data from outside the
 process, and `pickle.loads` on those bytes is arbitrary code execution
 (CWE-502). Every value the platform caches is already JSON-native, so cached
-values must stay JSON-serialisable; a payload that is not valid JSON on read
-raises `ValueError` naming the key rather than degrading to a silent miss.
+values must stay JSON-serialisable. A payload that is not valid JSON on read —
+corruption, or a value left by an older pickle-based build — is logged once and
+reported as a cache *miss*: snapshot keys carry no TTL, so raising made a single
+legacy value fatal for as long as it sat in Redis. It is never unpickled.
 
 **Every idempotency marker needs a TTL.** Use `IDEMPOTENCY_TTL_SECONDS` (24 h)
 for "already handled this event" keys. Without one, each unique event leaves a

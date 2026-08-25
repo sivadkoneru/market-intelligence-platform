@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from libs.common import get_cache, get_message_bus, get_timeseries_store
+from libs.common import close_log_sink, get_cache, get_message_bus, get_timeseries_store
 from libs.common.service_app import bootstrap_service_logging, create_service_app
 from services.api.routes.alerts import router as alerts_router
 from services.api.routes.insights import router as insights_router
@@ -53,6 +53,9 @@ def create_app(service: APIService | None = None) -> FastAPI:
             yield
         finally:
             await resolved_service.close()
+            # The API builds its own lifespan rather than using
+            # worker_lifespan, so it closes the log sink itself.
+            await close_log_sink()
 
     app = create_service_app(
         service_name="api",

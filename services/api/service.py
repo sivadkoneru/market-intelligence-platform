@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -31,9 +32,18 @@ from libs.common import (
 API_SUBSCRIPTION = "api"
 API_WS_SUBSCRIPTION = "api-ws"
 HISTORY_PREFIX = "history"
-# How far back the peek-based read model looks. peek() returns from the head
-# of the subscription, so responses take the TAIL of this window.
+# Fallback window for a bus that cannot supply sequence numbers. peek() returns
+# from the head of the subscription, so responses take the TAIL of this window.
 BUS_PEEK_WINDOW = 1_000
+# How many validated payloads per topic the read model keeps. Well above the
+# routes' `le=100` cap, so /signals and /alerts are always served in full. An
+# insight older than this is served from the Redis cache only.
+RECENT_WINDOW = 500
+# Messages read per peek call while catching up, and the cap on how many such
+# calls one request may make. The cap bounds the cost of a cold first request
+# against a large backlog; the cursor persists, so the next request continues.
+PEEK_CHUNK = 100
+MAX_PEEK_CHUNKS_PER_REQUEST = 20
 STREAM_POLL_INTERVAL_SECONDS = 0.05
 MAX_STREAM_QUEUE_SIZE = 1_000
 TopicModel = type[MarketEvent] | type[Signal] | type[Alert] | type[Insight]
@@ -294,6 +304,13 @@ class APIService:
         self.metrics = APIMetrics()
         self._log = get_logger(__name__)
         self._stream_broker = LiveStreamBroker(bus=bus)
+        # Incremental read model over the peeked topics: validated payloads in
+        # arrival order, plus the sequence number to resume each peek from.
+        self._recent: dict[str, deque[dict[str, Any]]] = {
+            topic: deque(maxlen=RECENT_WINDOW)
+            for topic in (signal_topic, alert_topic, insight_topic)
+        }
+        self._peek_cursor: dict[str, int] = {}
 
     @property
     def timeseries_backend(self) -> str:
@@ -401,8 +418,9 @@ class APIService:
         ordered = sorted(merged_rows, key=self._ts_sort_key)
         if limit is not None:
             # Cached rows are merged in after the store's own LIMIT, so cap the
-            # combined result too — newest wins.
-            ordered = ordered[-limit:]
+            # combined result too — newest wins. A non-positive limit asks for
+            # no rows; ``[-0:]`` would hand back every one of them.
+            ordered = ordered[-limit:] if limit > 0 else []
         return [self._normalise_row(row) for row in ordered]
 
     async def indicators(self, symbol: str) -> dict[str, Any] | None:
@@ -454,6 +472,58 @@ class APIService:
             },
         }
 
+    async def _refresh_recent(
+        self,
+        topic: str,
+        model: type[Signal] | type[Alert] | type[Insight],
+    ) -> list[dict[str, Any]]:
+        """
+        Bring the read model for *topic* up to date and return it, oldest first.
+
+        ``peek`` reads from the head of the subscription — the lowest sequence
+        numbers — so asking it for *limit* messages returns the OLDEST ones and
+        pins the response to the same backlog on every call. Reading the whole
+        window instead fixed that but re-read (and re-decoded) the entire
+        backlog on every request. So the window is walked once and remembered:
+        each request resumes at the sequence number the last one stopped at and
+        pays only for messages that arrived since.
+        """
+        recent = self._recent[topic]
+        cursor = self._peek_cursor.get(topic)
+        for _ in range(MAX_PEEK_CHUNKS_PER_REQUEST):
+            messages = await self._bus.peek(
+                topic,
+                self._subscription,
+                n=PEEK_CHUNK,
+                from_sequence_number=cursor,
+            )
+            if not messages:
+                break
+            if messages[-1].sequence_number is None:
+                # A bus that cannot number its messages gives no cursor to
+                # resume from, so re-reading a fixed window is the only correct
+                # option left. Nothing is remembered: appending would duplicate
+                # the same messages on the next request.
+                return self._validated_payloads(
+                    await self._bus.peek(topic, self._subscription, n=BUS_PEEK_WINDOW),
+                    model,
+                )
+            recent.extend(self._validated_payloads(messages, model))
+            cursor = messages[-1].sequence_number + 1
+            self._peek_cursor[topic] = cursor
+            if len(messages) < PEEK_CHUNK:
+                break
+        else:
+            # Still behind after the per-request cap. The cursor is saved, so
+            # the next request picks up where this one stopped.
+            self._log.warning(
+                "api.recent_catch_up_truncated",
+                topic=topic,
+                subscription=self._subscription,
+                cursor=cursor,
+            )
+        return list(recent)
+
     async def _recent_payloads(
         self,
         topic: str,
@@ -461,18 +531,11 @@ class APIService:
         *,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """
-        Return the newest *limit* payloads on *topic*, newest first.
-
-        ``peek`` reads from the head of the subscription — the lowest sequence
-        numbers — so asking it for *limit* messages returns the OLDEST ones and
-        pins the response to the same backlog on every call. Peek a wider
-        window and take its tail instead. Only the returned slice is validated,
-        so cost stays proportional to *limit* rather than to the backlog.
-        """
-        messages = await self._bus.peek(topic, self._subscription, n=BUS_PEEK_WINDOW)
-        newest_first = list(reversed(messages[-limit:])) if limit > 0 else []
-        return self._validated_payloads(newest_first, model)
+        """Return the newest *limit* payloads on *topic*, newest first."""
+        if limit <= 0:
+            return []
+        payloads = await self._refresh_recent(topic, model)
+        return list(reversed(payloads[-limit:]))
 
     async def signals(self, *, limit: int = 20) -> list[dict[str, Any]]:
         self.metrics.signals_requests += 1
@@ -491,18 +554,12 @@ class APIService:
         if cached is not None:
             return Insight.model_validate(cached).model_dump(mode="json")
 
-        messages = await self._bus.peek(
-            self._insight_topic,
-            self._subscription,
-            n=BUS_PEEK_WINDOW,
-        )
-        # Newest first, validated lazily: eagerly validating the whole window to
-        # find one symbol cost a full pass of Pydantic work per request and
-        # could emit a warning line — mirrored to Elasticsearch — for every
-        # invalid message in the backlog.
-        for message in reversed(messages):
-            payload = self._validated_payload(message, Insight)
-            if payload is not None and payload.get("symbol") == symbol:
+        # Served from the same incremental read model as /signals and /alerts,
+        # so a cache miss no longer re-peeks the whole backlog: each message is
+        # peeked and validated once, then scanned newest-first for the symbol.
+        payloads = await self._refresh_recent(self._insight_topic, Insight)
+        for payload in reversed(payloads):
+            if payload.get("symbol") == symbol:
                 return payload
         return None
 

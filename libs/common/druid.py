@@ -187,6 +187,11 @@ class InMemoryTimeSeriesStore:
             if frm_utc <= ts <= to_utc:
                 result.append(r)
         if limit is not None:
+            # A non-positive limit asks for no rows. Slicing ``[-0:]`` returns
+            # the *whole* list, so the fake answered a zero limit with every row
+            # while DruidClient's ``LIMIT 0`` answered with none.
+            if limit <= 0:
+                return []
             # Newest rows win when the window is truncated, matching the
             # ORDER BY __time DESC ... LIMIT that DruidClient pushes down.
             result.sort(key=lambda r: self._parse_ts(r.get("ts")) or self._OLDEST)
@@ -357,6 +362,10 @@ class DruidClient:
         )
         if limit is None:
             return await self.query_sql(where + 'ORDER BY "__time" ASC')
+        if limit <= 0:
+            # No rows were asked for. Answered without a round trip, and never
+            # as ``LIMIT -1``, which Druid rejects as a SQL error.
+            return []
 
         # Bound the transfer at the source: an unbounded window otherwise
         # streams every tick for the symbol into API memory. Taking the newest

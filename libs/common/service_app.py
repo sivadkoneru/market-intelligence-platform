@@ -28,6 +28,7 @@ from fastapi.responses import PlainTextResponse
 from libs.common.config import Settings, get_settings
 from libs.common.es import get_search_store
 from libs.common.logging import (
+    close_log_sink,
     configure_logging,
     configure_new_relic,
     get_logger,
@@ -111,6 +112,10 @@ def worker_lifespan(
                         await task
             if close is not None:
                 await close()
+            # The log sink's search store is built by
+            # ``bootstrap_service_logging``, not by the service, so no
+            # ``close_backends`` call reaches it.
+            await close_log_sink()
 
     return lifespan
 

@@ -78,14 +78,31 @@ def decode_cache_value(key: str, raw: bytes) -> Any:
     """
     Deserialise a Redis payload written by :func:`encode_cache_value`.
 
-    Raises ``ValueError`` naming *key* when the stored bytes are not valid JSON
-    (corruption, or a value written by an older pickle-based build) so the
-    failure is diagnosable instead of silently degrading to a cache miss.
+    A payload that is not valid JSON — corruption, or a value left behind by an
+    older pickle-based build — is reported as a cache *miss*: one warning naming
+    the key, then ``None``. Raising instead made a single legacy value fatal
+    forever, because snapshot keys carry no TTL: ``/market/{symbol}/latest``
+    answered 500 on every request and the stream/AI/alerting poll loops stalled.
+    A miss is recoverable — the caller falls back to the store and the next write
+    replaces the value. Decoding stays JSON-only; pickle is never read back.
+
+    The value itself is never logged: it is untrusted input, and may be exactly
+    the pickle payload that must not be deserialised.
     """
     try:
         return json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cache value for key {key!r} is not valid JSON") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Imported here rather than at module scope: ``libs.common.logging``
+        # pulls in the search-store port, and this module is imported from
+        # ``libs.common.__init__``.
+        from libs.common.logging import get_logger
+
+        get_logger(__name__).warning(
+            "cache.undecodable_value_ignored",
+            key=key,
+            bytes=len(raw),
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------

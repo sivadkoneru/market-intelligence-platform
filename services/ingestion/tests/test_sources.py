@@ -337,3 +337,103 @@ async def test_rss_collector_caps_entries_per_poll() -> None:
 
     events = await collector.poll_once()
     assert len(events) == MAX_ENTRIES_PER_FEED
+
+
+class _FakeStreamContent:
+    """Stand-in for aiohttp's StreamReader, delivering the body in chunks."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def iter_chunked(self, size: int):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def read(self, n: int = -1) -> bytes:
+        # aiohttp returns whatever is buffered rather than n bytes; modelling
+        # that is what makes these tests fail against a single read() call.
+        return self._chunks[0] if self._chunks else b""
+
+
+class _FakeResponse:
+    def __init__(self, chunks: list[bytes], charset: str | None = "utf-8") -> None:
+        self.content = _FakeStreamContent(chunks)
+        self.charset = charset
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def __aenter__(self) -> "_FakeResponse":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    def get(self, url: str) -> _FakeResponse:
+        return self._response
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _patch_session(monkeypatch: pytest.MonkeyPatch, response: _FakeResponse) -> None:
+    monkeypatch.setattr(
+        "services.ingestion.sources.rss.aiohttp.ClientSession",
+        lambda *args, **kwargs: _FakeSession(response),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_rss_text_reads_a_feed_delivered_in_several_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``StreamReader.read(n)`` returns what is buffered, not n bytes, so a single
+    read truncated every multi-chunk feed mid-document.
+    """
+    from services.ingestion.sources.rss import _fetch_rss_text, _parse_feed_entries
+
+    body = RSS_XML.encode("utf-8")
+    chunks = [body[i : i + 16] for i in range(0, len(body), 16)]
+    assert len(chunks) > 1, "the fixture must arrive in more than one chunk"
+    _patch_session(monkeypatch, _FakeResponse(chunks))
+
+    payload = await _fetch_rss_text("https://example.com/feed.xml")
+
+    assert payload == RSS_XML
+    assert len(_parse_feed_entries(payload)) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_rss_text_still_caps_an_oversized_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.ingestion.sources.rss import MAX_FEED_BYTES, _fetch_rss_text
+
+    chunk = b"x" * (1024 * 1024)
+    _patch_session(
+        monkeypatch,
+        _FakeResponse([chunk] * (MAX_FEED_BYTES // len(chunk) + 2)),
+    )
+
+    with pytest.raises(ValueError, match="exceeds"):
+        await _fetch_rss_text("https://example.com/huge.xml")
+
+
+def test_payload_size_is_measured_in_bytes_not_characters() -> None:
+    """``len()`` of a str counts characters, so multi-byte feeds slipped the cap."""
+    from services.ingestion.sources.rss import MAX_FEED_BYTES, _parse_feed_entries
+
+    # Just under the cap in characters, comfortably over it in UTF-8 bytes.
+    oversized = "<rss>" + ("é" * (MAX_FEED_BYTES - 100)) + "</rss>"
+
+    with pytest.raises(ValueError, match="exceeds"):
+        _parse_feed_entries(oversized)

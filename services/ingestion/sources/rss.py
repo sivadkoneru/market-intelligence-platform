@@ -100,8 +100,15 @@ def _reject_doctype(xml_payload: str | bytes) -> None:
         raise ValueError("feed declares a DOCTYPE; refusing to parse untrusted DTD")
 
 
+def _payload_bytes(xml_payload: str | bytes) -> int:
+    """Size of *xml_payload* in bytes — ``len()`` of a ``str`` counts characters."""
+    if isinstance(xml_payload, str):
+        return len(xml_payload.encode("utf-8"))
+    return len(xml_payload)
+
+
 def _parse_feed_entries(xml_payload: str | bytes) -> list[ET.Element]:
-    if len(xml_payload) > MAX_FEED_BYTES:
+    if _payload_bytes(xml_payload) > MAX_FEED_BYTES:
         raise ValueError(f"feed payload exceeds {MAX_FEED_BYTES} bytes")
     _reject_doctype(xml_payload)
 
@@ -158,16 +165,26 @@ def _normalize_rss_entry(
     )
 
 
+FEED_CHUNK_BYTES = 64 * 1024
+
+
 async def _fetch_rss_text(url: str) -> str:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as response:
         response.raise_for_status()
         # Read with a hard cap rather than response.text(): a hostile or
         # broken feed must not be able to stream unbounded bytes into memory.
-        raw = await response.content.read(MAX_FEED_BYTES + 1)
-        if len(raw) > MAX_FEED_BYTES:
-            raise ValueError(f"feed at {url} exceeds {MAX_FEED_BYTES} bytes")
-        return raw.decode(response.charset or "utf-8", "replace")
+        #
+        # Chunked rather than a single ``content.read(n)``: that call returns
+        # whatever is already buffered, so any feed arriving in more than one
+        # chunk was silently truncated mid-document and then failed to parse.
+        # The cap is re-checked per chunk, so at most one chunk overshoots it.
+        buffer = bytearray()
+        async for chunk in response.content.iter_chunked(FEED_CHUNK_BYTES):
+            buffer.extend(chunk)
+            if len(buffer) > MAX_FEED_BYTES:
+                raise ValueError(f"feed at {url} exceeds {MAX_FEED_BYTES} bytes")
+        return bytes(buffer).decode(response.charset or "utf-8", "replace")
 
 
 class RssCollector:

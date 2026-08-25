@@ -84,6 +84,6 @@ consumes it, read the result through the API with `GET /insights/BTCUSDT`.
 ## Dependencies
 
 Pinned in `requirements.txt`: FastAPI, Uvicorn, Pydantic v2, pydantic-settings,
-structlog, Azure Service Bus, aiohttp, websockets, and orjson. Tests use the
+structlog, Azure Service Bus, aiohttp, and websockets. Tests use the
 root development requirements and the in-memory bus; no network or secrets are
 required.

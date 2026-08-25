@@ -17,6 +17,7 @@ ReceivedMessage     — Simple dataclass representing a received message.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import uuid
@@ -47,6 +48,11 @@ class ReceivedMessage:
     body: dict[str, Any]
     message_id: str
     correlation_id: str | None = None
+    # Broker-assigned, monotonically increasing within a subscription. Lets a
+    # reader resume a peek where the last one stopped instead of re-reading the
+    # backlog. Optional: a bus implementation that cannot supply it leaves None,
+    # and readers fall back to peeking a fixed window.
+    sequence_number: int | None = None
     # Internal — used by InMemoryBus to locate and complete/dead-letter
     _queue_ref: Any = dataclasses.field(default=None, repr=False)
     _dlq: bool = dataclasses.field(default=False, repr=False)
@@ -84,6 +90,7 @@ class MessageBus(Protocol):
         topic: str,
         subscription: str,
         n: int = 10,
+        from_sequence_number: int | None = None,
     ) -> list[ReceivedMessage]: ...
 
     async def receive_dead_letter(
@@ -123,6 +130,9 @@ class InMemoryBus:
         self._seen_ids: dict[str, set[str]] = defaultdict(set)
         # Messages pending completion: id(msg) → (queue_deque, msg)
         self._in_flight: dict[int, tuple[deque[ReceivedMessage], ReceivedMessage]] = {}
+        # topic → next sequence number. Publishing fans out in order, so one
+        # counter per topic is monotonic within every subscription too.
+        self._next_sequence: dict[str, int] = defaultdict(lambda: 1)
 
     # --- publisher ---
 
@@ -139,6 +149,9 @@ class InMemoryBus:
             return  # duplicate — drop silently
         self._seen_ids[topic].add(mid)
 
+        sequence_number = self._next_sequence[topic]
+        self._next_sequence[topic] = sequence_number + 1
+
         # Fan out to every subscription that has ever been accessed on this topic
         for sub_name, queue in self._queues[topic].items():
             msg = ReceivedMessage(
@@ -147,6 +160,7 @@ class InMemoryBus:
                 body=body,
                 message_id=mid,
                 correlation_id=correlation_id,
+                sequence_number=sequence_number,
                 _queue_ref=queue,
             )
             queue.append(msg)
@@ -182,10 +196,24 @@ class InMemoryBus:
         topic: str,
         subscription: str,
         n: int = 10,
+        from_sequence_number: int | None = None,
     ) -> list[ReceivedMessage]:
-        """Return up to *n* messages without removing them from the queue."""
+        """
+        Return up to *n* messages without removing them from the queue.
+
+        With *from_sequence_number*, the scan starts at that sequence number
+        instead of the head of the queue, so a caller can read only what has
+        arrived since its last peek.
+        """
         queue = self._queues[topic][subscription]
-        return list(queue)[:n]
+        messages = list(queue)
+        if from_sequence_number is not None:
+            messages = [
+                msg
+                for msg in messages
+                if msg.sequence_number is not None and msg.sequence_number >= from_sequence_number
+            ]
+        return messages[:n]
 
     async def receive_dead_letter(
         self,
@@ -275,6 +303,8 @@ class ServiceBusBus:
         self._senders: dict[str, Any] = {}
         # (topic, subscription, sub_queue) → open ServiceBusReceiver
         self._receivers: dict[tuple[str, str, str | None], Any] = {}
+        # One lock per cached receiver, guarding concurrent peeks. See peek().
+        self._receiver_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -292,6 +322,18 @@ class ServiceBusBus:
         if topic not in self._senders:
             self._senders[topic] = self._client.get_topic_sender(topic_name=topic)
         return self._senders[topic]
+
+    def _get_receiver_lock(
+        self,
+        topic: str,
+        subscription: str,
+        sub_queue: str | None = None,
+    ) -> asyncio.Lock:
+        """Return the lock guarding the cached receiver for this key."""
+        key = (topic, subscription, sub_queue)
+        if key not in self._receiver_locks:
+            self._receiver_locks[key] = asyncio.Lock()
+        return self._receiver_locks[key]
 
     def _get_receiver(
         self,
@@ -380,25 +422,38 @@ class ServiceBusBus:
         topic: str,
         subscription: str,
         n: int = 10,
+        from_sequence_number: int | None = None,
     ) -> list[ReceivedMessage]:
-        receiver = self._client.get_subscription_receiver(
-            topic_name=topic,
-            subscription_name=subscription,
-        )
+        """
+        Peek up to *n* messages, optionally resuming at *from_sequence_number*.
+
+        The receiver comes from the shared cache rather than being built and
+        torn down per call: peeking neither locks nor consumes, so it can share
+        the link ``receive`` uses, and a fresh AMQP link per request was pure
+        setup cost on the API's hottest read path. A receiver is not safe for
+        concurrent use, though, and two API requests peek at once as a matter of
+        routine — so the shared link is held for the length of one peek.
+        """
+        receiver = self._get_receiver(topic, subscription)
         msgs: list[ReceivedMessage] = []
-        async with receiver:
-            peeked = await receiver.peek_messages(max_message_count=n)
-            for raw in peeked:
-                body = _decode_servicebus_body(raw.body)
-                msgs.append(
-                    ReceivedMessage(
-                        topic=topic,
-                        subscription=subscription,
-                        body=body,
-                        message_id=str(raw.message_id or ""),
-                        correlation_id=str(raw.correlation_id or ""),
-                    )
+        async with self._get_receiver_lock(topic, subscription):
+            peeked = await receiver.peek_messages(
+                max_message_count=n,
+                sequence_number=from_sequence_number,
+            )
+        for raw in peeked:
+            body = _decode_servicebus_body(raw.body)
+            raw_sequence = getattr(raw, "sequence_number", None)
+            msgs.append(
+                ReceivedMessage(
+                    topic=topic,
+                    subscription=subscription,
+                    body=body,
+                    message_id=str(raw.message_id or ""),
+                    correlation_id=str(raw.correlation_id or ""),
+                    sequence_number=int(raw_sequence) if raw_sequence is not None else None,
                 )
+            )
         return msgs
 
     async def receive_dead_letter(
